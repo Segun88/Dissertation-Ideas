@@ -27,6 +27,7 @@ library(marginaleffects)
 humanrv <- read_dta("rhr (realfresh).dta") |> as_tibble()
 nonstate <- read_dta("nsa_v3.4_21 copy.dta") |> as_tibble()
 forge <- read_dta("newforge_v1.0_public.dta") |> as_tibble()
+
 rebleader <- read_dta("ROLE 1.1 Final.dta") |> as_tibble()
 
 
@@ -44,7 +45,6 @@ forge <- forge %>%
   rename(
     dyadid1 = ns_adyadid
   )
-
 
 
 
@@ -129,7 +129,7 @@ nonstate_sel <- nonstate_sel %>%
   )
 
 
-# Quick check that rename worked
+# Checking that rename worked
 names(nonstate_sel)[names(nonstate_sel) %in% c("start_ns", "end_ns")]
 
 
@@ -140,22 +140,14 @@ forge_nonstate <- left_join(
   by = c("sideb", "dyadid1")
 ) |>
   as_tibble()
-for_nonstate <- inner_join(
+
+
+forge_nonstate <- inner_join(
   forge_clean,
   nonstate_sel,
   by = c("sideb", "dyadid1")
 ) |>
   as_tibble()
-
-
-safe_max <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
-safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
-na_str_to_na <- function(x) {
-  x <- as.character(x)
-  x[x %in% c("NA", "na", "Na", "nA")] <- NA_character_
-  x
-}
-norm_txt <- function(x) str_squish(str_to_lower(x))
 
 
 #######################################################################
@@ -172,25 +164,13 @@ hr_final <- left_join(humanrv_clean, forge_nonstate, by = c("sideb")) |>
 
 
 
-# See the year range
-
+# Checking the year range
 range(hr_final$year, na.rm = TRUE)
 
 # Count observations per conflict
 hr_final |>
   count(sideb, sidea.x, name = "years_observed") |>
   arrange(desc(years_observed))
-
-# See which conflicts have the most years of data
-hr_final |>
-  group_by(sideb, sidea.x) |>
-  summarise(
-    years = n(),
-    year_range = paste(min(year), "-", max(year)),
-    .groups = "drop"
-  ) |>
-  arrange(desc(years))
-
 
 
 hr_final_clean <- hr_final |>
@@ -199,22 +179,18 @@ hr_final_clean <- hr_final |>
 
 
 # Verifying if it worked
-
 names(hr_final_clean)[grepl("sidea", names(hr_final_clean))]
-
 
 
 # Quick overview of the cleaned dataset
 glimpse(hr_final_clean)
 
-# Or check the structure
-str(hr_final_clean)
 
-# Verify your key variables are intact
+
+# Verifying key variables are intact
 hr_final_clean |>
   count(sideb, sidea, name = "years_observed") |>
   arrange(desc(years_observed))
-
 
 
 
@@ -230,8 +206,6 @@ hr_final_clean <- hr_final_clean %>%
   )
 
 
-
-
 group_start <- hr_final_clean %>%
   group_by(dyadid1, sidea, sideb) %>%
   summarise(
@@ -239,6 +213,7 @@ group_start <- hr_final_clean %>%
     first_year = suppressWarnings(min(year, na.rm = TRUE)),
     .groups = "drop"
   ) %>%
+
   # Vectorized clean-up: if min_start_ns is Inf (all missing), set to NA
   mutate(
     min_start_ns = as.Date(ifelse(
@@ -248,14 +223,13 @@ group_start <- hr_final_clean %>%
     ))
   ) %>%
   mutate(
-    # Use earliest non-missing start_ns; otherwise fallback to Jan 1 of first observed year
+    # Use earliest non-missing start_ns; or fallback to Jan 1 of first observed year
     start_group = coalesce(
       min_start_ns,
       as.Date(sprintf("%d-01-01", first_year))
     )
   ) %>%
   dplyr::select(dyadid1, sidea, sideb, start_group)
-
 
 
 hr_final_clean <- hr_final_clean %>%
@@ -279,7 +253,6 @@ hr_final_clean <- hr_final_clean %>%
   )
 
 
-
 analysis_df <- hr_final_clean %>% filter(!is.na(duration_years_ongoing))
 
 
@@ -287,7 +260,7 @@ analysis_df <- hr_final_clean %>% filter(!is.na(duration_years_ongoing))
 
 ###########################################################################
 
-
+###Standardizing Country Names to three-letter country codes
 
 humanrv_aug <- hr_final_clean %>%
   mutate(
@@ -334,6 +307,8 @@ if (anyNA(humanrv_aug$iso3c)) {
 }
 
 
+## Getting GDP data
+
 ## 2) WDI GDP per capita (constant 2015 US$) --------------------------------
 wdi_raw <- WDI(
   country = "all",
@@ -357,7 +332,7 @@ message(sprintf(
   mean(!is.na(hr_with_gdp$gdppc_const2015)) * 100
 ))
 
-## 3) Fill short GDP gaps (linear interpolation, no warnings)
+
 wdi_series <- hr_with_gdp %>%
   distinct(iso3c, year, gdppc_const2015) %>%
   arrange(iso3c, year)
@@ -391,6 +366,7 @@ hr_with_gdp_filled <- hr_with_gdp %>%
     by = c("iso3c", "year")
   )
 
+
 # Coverage check
 hr_with_gdp_filled %>%
   summarise(
@@ -402,7 +378,7 @@ hr_with_gdp_filled %>%
 
 
 
-## 4) Read V-Dem (Stata .dta), convert COW → ISO3C --------------------------
+## 4) Read V-Dem (Stata .dta), convert COW → ISO3C 
 
 
 vdem_raw <- read_dta("V-Dem-CY-Core-v15.dta")
@@ -419,7 +395,8 @@ vdem_keep <- vdem_raw %>%
   filter(!is.na(iso3c), !is.na(year)) %>%
   dplyr::select(year, iso3c, v2x_polyarchy)
 
-## 5) Merge democracy + create modeling vars --------------------------------
+
+## 5) Merge democracy + create modeling vars 
 hr_model_ready <- hr_with_gdp_filled %>%
   left_join(vdem_keep, by = c("iso3c", "year")) %>%
   mutate(
@@ -474,11 +451,11 @@ print(diag)
 # From the combined dataset
 full_model <- hr_model_ready
 
-# drop the duplicate ".y" cols if present
+# droping the duplicate ".y" 
 full_model <- full_model %>%
   dplyr::select(-tidyselect::any_of(c("dyadid1.y", "startdate.y", "sidea.y")))
 
-# conditionally rename ".x" → clean names (only if those columns exist)
+# conditionally rename ".x" → clean names 
 if ("dyadid1.x" %in% names(full_model)) {
   full_model <- dplyr::rename(full_model, dyadid1 = dyadid1.x)
 }
@@ -531,7 +508,6 @@ matched <- full_model %>% filter(!is.na(gname))
 
 full_model <- full_model %>%
   mutate(
-    # Add the violation scores first
     count_violations = rowSums(
       across(c(
         rkillings_s,
@@ -672,7 +648,6 @@ nrow(hr_model_corrected)
 
 
 
-# Load required libraries
 
 # Descriptive statistics table
 descriptive_stats <- hr_model_corrected %>%
