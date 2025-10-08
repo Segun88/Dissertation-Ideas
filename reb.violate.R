@@ -51,7 +51,7 @@ forge <- forge %>%
   rename(dyadid1 = ns_adyadid)
 
 
-# Select Variables from FORGE Dataset ----------------------------------------
+# Select Variables from FORGE Dataset 
 # Keep only rebel group organizational characteristics
 forge_vars <- c(
   "dyadid1", "sideb", "gname", "ccode", "cname", "conflict_id",
@@ -64,7 +64,7 @@ forge_vars <- c(
 forge_clean <- forge %>% dplyr::select(dplyr::any_of(forge_vars))
 
 
-# Select Variables from Non-State Actor Dataset ------------------------------
+# Select Variables from Non-State Actor Dataset 
 # Keep rebel capacity, territorial control, and external support variables
 nonstate_keep <- c(
   "dyadid1", "sidea", "sideb", "startdate", "enddate",
@@ -353,7 +353,7 @@ full_model <- full_model %>%
   )
 
 
-# Create Rebel Organization Variables ---------------------------------------
+# Create Rebel Organization Variables 
 # Categorize types of parent organizations
 full_model <- full_model %>%
   mutate(
@@ -372,7 +372,7 @@ full_model <- full_model %>%
   )
 
 
-# Convert Categorical Variables to Binary ------------------------------------
+# Convert Categorical Variables to Binary 
 # Normalize text labels and create binary indicators
 normalize_chr <- function(x) {
   tolower(trimws(as.character(haven::as_factor(x))))
@@ -416,7 +416,7 @@ full_model <- full_model %>%
   mutate(violation_s = as.integer(violation_s))
 
 
-# Create Final Analysis Dataset ----------------------------------------------
+# Create Final Analysis Dataset 
 # Keep only complete cases for regression analysis
 hr_model_corrected <- full_model %>%
   filter(if_all(
