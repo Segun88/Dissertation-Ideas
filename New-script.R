@@ -1,5 +1,9 @@
-# ---- 1. Load Required Libraries ----
 
+# ============================================================================
+# REBEL HUMAN RIGHTS VIOLATIONS: DATA PREPARATION SCRIPT
+# ============================================================================
+
+# Load Required Packages 
 library(haven)
 library(dplyr)
 library(tidyverse)
@@ -24,124 +28,64 @@ library(pscl)
 library(marginaleffects)
 
 
+# Import Raw Datasets --------------------------------------------------------
 humanrv <- read_dta("rhr (realfresh).dta") |> as_tibble()
 nonstate <- read_dta("nsa_v3.4_21 copy.dta") |> as_tibble()
 forge <- read_dta("newforge_v1.0_public.dta") |> as_tibble()
-
 rebleader <- read_dta("ROLE 1.1 Final.dta") |> as_tibble()
 
 
+# Clean Variable Names -------------------------------------------------------
 nonstate <- nonstate %>% clean_names()
 forge <- forge %>% clean_names()
 
 
+# Standardize Key Identifiers ------------------------------------------------
+# Rename to ensure consistent dyad and rebel group IDs across datasets
 nonstate <- nonstate %>%
   rename(
     dyadid1 = dyadid,
-    sideb = side_b # <- use side_b here
+    sideb = side_b
   )
 
 forge <- forge %>%
-  rename(
-    dyadid1 = ns_adyadid
-  )
+  rename(dyadid1 = ns_adyadid)
 
 
-
+# Select Variables from FORGE Dataset 
+# Keep only rebel group organizational characteristics
 forge_vars <- c(
-  "dyadid1",
-  "sideb",
-  "gname",
-  "ccode",
-  "cname",
-  "conflict_id",
-  "foundyear",
-  "ideology",
-  "preorg",
-  "preorgno",
-  "preorgreb",
-  "preorgter",
-  "preorgpar",
-  "preorgmvt",
-  "preorgyou",
-  "preorglab",
-  "preorgmil",
-  "preorggov",
-  "preorgfmr",
-  "preorgrel",
-  "preorgfor",
-  "preorgref",
-  "preorgeth",
-  "preorgoth",
-  "preorgname",
-  "merger",
-  "splinter"
+  "dyadid1", "sideb", "gname", "ccode", "cname", "conflict_id",
+  "foundyear", "ideology", "preorg", "preorgno", "preorgreb", "preorgter",
+  "preorgpar", "preorgmvt", "preorgyou", "preorglab", "preorgmil",
+  "preorggov", "preorgfmr", "preorgrel", "preorgfor", "preorgref",
+  "preorgeth", "preorgoth", "preorgname", "merger", "splinter"
 )
 
-forge_clean <- forge[, forge_vars]
 forge_clean <- forge %>% dplyr::select(dplyr::any_of(forge_vars))
 
 
-#########################################################################
-
-
-
-
+# Select Variables from Non-State Actor Dataset 
+# Keep rebel capacity, territorial control, and external support variables
 nonstate_keep <- c(
-  "dyadid1",
-  "sidea",
-  "sideb",
-  "startdate",
-  "enddate",
-  "rebestimate",
-  "rebestlow",
-  "rebesthigh",
-  "rebstrength",
-  "centcontrol",
-  "strengthcent",
-  "mobcap",
-  "armsproc",
-  "fightcap",
-  "terrcont",
-  "effterrcont",
-  "transconstsupp",
-  "rebextpart",
-  "rebelsupport",
-  "govsupport",
-  "govextpart",
-  "typeoftermination",
-  "victoryside"
+  "dyadid1", "sidea", "sideb", "startdate", "enddate",
+  "rebestimate", "rebestlow", "rebesthigh", "rebstrength",
+  "centcontrol", "strengthcent", "mobcap", "armsproc",
+  "fightcap", "terrcont", "effterrcont", "transconstsupp",
+  "rebextpart", "rebelsupport", "govsupport", "govextpart",
+  "typeoftermination", "victoryside"
 )
 
-
-nonstate_clean <- nonstate %>% dplyr::select(dplyr::any_of(nonstate_keep))
 nonstate_sel <- nonstate %>%
-  dplyr::select(dplyr::any_of(nonstate_keep))
-
-
-# Rename startdate/enddate in nonstate_sel to avoid conflicts
-
-
-nonstate_sel <- nonstate_sel %>%
+  dplyr::select(dplyr::any_of(nonstate_keep)) %>%
   rename(
-    start_ns = startdate, # group-level start date
-    end_ns = enddate # group-level end date
+    start_ns = startdate,  # Rebel group start date
+    end_ns = enddate       # Rebel group end date
   )
 
 
-# Checking that rename worked
-names(nonstate_sel)[names(nonstate_sel) %in% c("start_ns", "end_ns")]
-
-
-
-forge_nonstate <- left_join(
-  forge_clean,
-  nonstate_sel,
-  by = c("sideb", "dyadid1")
-) |>
-  as_tibble()
-
-
+# Merge FORGE and Non-State Actor Data 
+# Combine organizational characteristics with conflict dynamics
 forge_nonstate <- inner_join(
   forge_clean,
   nonstate_sel,
@@ -150,62 +94,37 @@ forge_nonstate <- inner_join(
   as_tibble()
 
 
-#######################################################################
-
-
-
+# Prepare Human Rights Violations Dataset 
 humanrv_clean <- humanrv %>%
   janitor::clean_names() %>%
   dplyr::rename(dyadid1 = dyadid)
 
 
+# Merge All Conflict Data 
+# Combine human rights violations with rebel organizational data
 hr_final <- left_join(humanrv_clean, forge_nonstate, by = c("sideb")) |>
   as_tibble()
 
-
-
-# Checking the year range
-range(hr_final$year, na.rm = TRUE)
-
-# Count observations per conflict
-hr_final |>
-  count(sideb, sidea.x, name = "years_observed") |>
-  arrange(desc(years_observed))
-
-
+# Clean up duplicate columns
 hr_final_clean <- hr_final |>
   dplyr::select(-sidea.y) |>
   rename(sidea = sidea.x)
 
-
-# Verifying if it worked
-names(hr_final_clean)[grepl("sidea", names(hr_final_clean))]
-
-
-# Quick overview of the cleaned dataset
-glimpse(hr_final_clean)
-
-
-
-# Verifying key variables are intact
-hr_final_clean |>
-  count(sideb, sidea, name = "years_observed") |>
-  arrange(desc(years_observed))
-
-
-
+# Consolidate dyad IDs
 hr_final_clean <- hr_final_clean %>%
   mutate(dyadid1 = dplyr::coalesce(dyadid1.x, dyadid1.y)) %>%
   dplyr::select(-dplyr::any_of(c("dyadid1.x", "dyadid1.y")))
 
 
+# Calculate Conflict Duration
+# Convert dates to proper format
 hr_final_clean <- hr_final_clean %>%
   mutate(
     start_ns = as.Date(start_ns),
     end_ns = as.Date(end_ns)
   )
 
-
+# Find earliest start date for each rebel group
 group_start <- hr_final_clean %>%
   group_by(dyadid1, sidea, sideb) %>%
   summarise(
@@ -213,8 +132,6 @@ group_start <- hr_final_clean %>%
     first_year = suppressWarnings(min(year, na.rm = TRUE)),
     .groups = "drop"
   ) %>%
-
-  # Vectorized clean-up: if min_start_ns is Inf (all missing), set to NA
   mutate(
     min_start_ns = as.Date(ifelse(
       is.finite(as.numeric(min_start_ns)),
@@ -223,7 +140,6 @@ group_start <- hr_final_clean %>%
     ))
   ) %>%
   mutate(
-    # Use earliest non-missing start_ns; or fallback to Jan 1 of first observed year
     start_group = coalesce(
       min_start_ns,
       as.Date(sprintf("%d-01-01", first_year))
@@ -231,19 +147,14 @@ group_start <- hr_final_clean %>%
   ) %>%
   dplyr::select(dyadid1, sidea, sideb, start_group)
 
-
+# Calculate duration measures
 hr_final_clean <- hr_final_clean %>%
   left_join(group_start, by = c("dyadid1", "sidea", "sideb")) %>%
   mutate(
     obs_end_of_year = as.Date(sprintf("%d-12-31", year)),
-
-    # ongoing duration = years since group started (measured at end of this observation year)
     duration_years_ongoing = as.numeric(
       pmax(obs_end_of_year, start_group) - start_group
-    ) /
-      365.25,
-
-    # total duration only if we know the end date
+    ) / 365.25,
     conflict_duration_days = as.numeric(ifelse(
       !is.na(end_ns),
       end_ns - start_group,
@@ -252,16 +163,11 @@ hr_final_clean <- hr_final_clean %>%
     conflict_duration_years = conflict_duration_days / 365.25
   )
 
-
+# Keep only observations with valid duration
 analysis_df <- hr_final_clean %>% filter(!is.na(duration_years_ongoing))
 
 
-
-
-###########################################################################
-
-###Standardizing Country Names to three-letter country codes
-
+# Standardize Country Names to ISO3 Codes 
 humanrv_aug <- hr_final_clean %>%
   mutate(
     sidea_std = str_squish(sidea),
@@ -269,47 +175,36 @@ humanrv_aug <- hr_final_clean %>%
   ) %>%
   mutate(
     iso3c = case_when(
-      sidea_std %in%
-        c(
-          "Congo (Kinshasa)",
-          "DR Congo",
-          "Democratic Republic of the Congo",
-          "Congo, Dem. Rep.",
-          "Congo, Democratic Republic of"
-        ) ~
-        "COD",
-      sidea_std %in%
-        c("Congo (Brazzaville)", "Republic of the Congo", "Congo") ~
-        "COG",
-      sidea_std %in%
-        c("Ivory Coast", "Cote d'Ivoire", "Côte d’Ivoire", "Côte d'Ivoire") ~
-        "CIV",
+      sidea_std %in% c("Congo (Kinshasa)", "DR Congo", 
+                       "Democratic Republic of the Congo",
+                       "Congo, Dem. Rep.", 
+                       "Congo, Democratic Republic of") ~ "COD",
+      sidea_std %in% c("Congo (Brazzaville)", 
+                       "Republic of the Congo", "Congo") ~ "COG",
+      sidea_std %in% c("Ivory Coast", "Cote d'Ivoire", 
+                       "Côte d'Ivoire") ~ "CIV",
       sidea_std %in% c("Eswatini", "Swaziland") ~ "SWZ",
       sidea_std %in% c("Burma", "Myanmar") ~ "MMR",
       sidea_std %in% c("Russia", "Russian Federation") ~ "RUS",
       sidea_std %in% c("Iran", "Iran (Islamic Republic of)") ~ "IRN",
       sidea_std %in% c("Syria", "Syrian Arab Republic") ~ "SYR",
-      sidea_std %in% c("Laos", "Lao PDR", "Lao People's Democratic Republic") ~
-        "LAO",
-      sidea_std %in%
-        c("Yemen (North Yemen)", "North Yemen", "Yemen Arab Republic") ~
-        "YEM",
+      sidea_std %in% c("Laos", "Lao PDR", 
+                       "Lao People's Democratic Republic") ~ "LAO",
+      sidea_std %in% c("Yemen (North Yemen)", "North Yemen", 
+                       "Yemen Arab Republic") ~ "YEM",
       TRUE ~ iso3c
     )
   )
 
-
-# sanity check: must have ISO3 for all rows
+# Checking all observations have country codes
 if (anyNA(humanrv_aug$iso3c)) {
-  stop(
-    "Some ISO3C codes are missing. Inspect with: humanrv_aug %>% filter(is.na(iso3c)) %>% distinct(sidea_std)"
-  )
+  stop("Some ISO3C codes are missing. Inspect with: 
+       humanrv_aug %>% filter(is.na(iso3c)) %>% distinct(sidea_std)")
 }
 
 
-## Getting GDP data
-
-## 2) WDI GDP per capita (constant 2015 US$) --------------------------------
+# Add GDP Per Capita Data 
+# Download World Bank GDP data
 wdi_raw <- WDI(
   country = "all",
   indicator = c(gdppc_const2015 = "NY.GDP.PCAP.KD"),
@@ -318,21 +213,15 @@ wdi_raw <- WDI(
   extra = TRUE
 )
 
-
 wdi_clean <- wdi_raw %>%
   transmute(iso3c = iso3c, year = year, gdppc_const2015) %>%
   filter(!is.na(iso3c), !is.na(year))
 
-# merge GDP → panel
+# Merge GDP data
 hr_with_gdp <- humanrv_aug %>%
   left_join(wdi_clean, by = c("iso3c", "year"))
 
-message(sprintf(
-  "WDI GDP coverage before fill: %.1f%%",
-  mean(!is.na(hr_with_gdp$gdppc_const2015)) * 100
-))
-
-
+# Fill missing GDP values with linear interpolation
 wdi_series <- hr_with_gdp %>%
   distinct(iso3c, year, gdppc_const2015) %>%
   arrange(iso3c, year)
@@ -358,8 +247,6 @@ wdi_filled <- wdi_series %>%
   ) %>%
   ungroup()
 
-
-
 hr_with_gdp_filled <- hr_with_gdp %>%
   left_join(
     wdi_filled %>% dplyr::select(iso3c, year, gdppc_const2015_filled),
@@ -367,22 +254,9 @@ hr_with_gdp_filled <- hr_with_gdp %>%
   )
 
 
-# Coverage check
-hr_with_gdp_filled %>%
-  summarise(
-    total_rows = n(),
-    coverage = mean(!is.na(gdppc_const2015_filled)) * 100
-  )
-
-
-
-
-
-## 4) Read V-Dem (Stata .dta), convert COW → ISO3C 
-
-
+# Add Democracy Data (V-Dem) 
+# Import V-Dem democracy indicators
 vdem_raw <- read_dta("V-Dem-CY-Core-v15.dta")
-
 
 vdem_keep <- vdem_raw %>%
   dplyr::select(year, COWcode, v2x_polyarchy) %>%
@@ -395,44 +269,21 @@ vdem_keep <- vdem_raw %>%
   filter(!is.na(iso3c), !is.na(year)) %>%
   dplyr::select(year, iso3c, v2x_polyarchy)
 
-
-## 5) Merge democracy + create modeling vars 
+# Merge democracy data and create analysis variables
 hr_model_ready <- hr_with_gdp_filled %>%
   left_join(vdem_keep, by = c("iso3c", "year")) %>%
   mutate(
-    # log GDP per capita (filled)
     log_rgdppc = log(gdppc_const2015_filled),
-
-    # democracy (primary): V-Dem Electoral Democracy Index
     vdem_edi = v2x_polyarchy,
-
-    # standardized democracy (z-score)
     vdem_edi_z = as.numeric(scale(vdem_edi)),
-
-    # optional democracy dummy for robustness (threshold 0.5)
     dem_dummy_vdem = if_else(!is.na(vdem_edi) & vdem_edi >= 0.5, 1L, 0L)
   ) %>%
   relocate(
-    sidea,
-    sideb,
-    year,
-    iso3c,
-    log_rgdppc,
-    vdem_edi,
-    vdem_edi_z,
-    dem_dummy_vdem
+    sidea, sideb, year, iso3c,
+    log_rgdppc, vdem_edi, vdem_edi_z, dem_dummy_vdem
   )
 
-
-
-## 6) Diagnostics ------------------------------------------------------------
-print(summary(hr_model_ready[, c(
-  "gdppc_const2015_filled",
-  "log_rgdppc",
-  "vdem_edi",
-  "vdem_edi_z"
-)]))
-
+# Check data coverage
 diag <- hr_model_ready %>%
   summarise(
     rows = n(),
@@ -444,18 +295,14 @@ diag <- hr_model_ready %>%
 print(diag)
 
 
-
-
-
-
-# From the combined dataset
+# Final Data Cleaning 
 full_model <- hr_model_ready
 
-# droping the duplicate ".y" 
+# Remove duplicate columns
 full_model <- full_model %>%
   dplyr::select(-tidyselect::any_of(c("dyadid1.y", "startdate.y", "sidea.y")))
 
-# conditionally rename ".x" → clean names 
+# Rename .x columns to clean names
 if ("dyadid1.x" %in% names(full_model)) {
   full_model <- dplyr::rename(full_model, dyadid1 = dyadid1.x)
 }
@@ -466,102 +313,71 @@ if ("sidea.x" %in% names(full_model)) {
   full_model <- dplyr::rename(full_model, sidea = sidea.x)
 }
 
-
-
-# safety: required keys must exist now
+# Verifying if required variables exist
 stopifnot(all(c("sidea", "sideb", "year", "dyadid1") %in% names(full_model)))
 
-# rows & duplicate-key check
-message(sprintf("Rows in full_model (after cleanup): %s", nrow(full_model)))
-
+# Check for duplicate observations
 dupe_key <- full_model %>%
   dplyr::count(sidea, sideb, year, name = "n") %>%
   dplyr::filter(n > 1)
 
 if (nrow(dupe_key) > 0) {
-  message(
-    "WARNING: Duplicate (sidea, sideb, year) rows detected. Showing first 10:"
-  )
+  message("WARNING: Duplicate (sidea, sideb, year) rows detected.")
   print(head(dupe_key, 10))
 } else {
   message("OK: No duplicate (sidea, sideb, year) rows.")
 }
 
-# coverage diagnostics
-diag <- full_model %>%
-  dplyr::summarise(
-    rows = dplyr::n(),
-    forge_match_pct = mean(!is.na(gname)) * 100,
-    gdp_cover_pct = mean(!is.na(gdppc_const2015_filled)) * 100,
-    vdem_cover_pct = mean(!is.na(v2x_polyarchy)) * 100
-  )
-print(diag)
 
-
-
-
-
-unmatched <- full_model %>% filter(is.na(gname))
-matched <- full_model %>% filter(!is.na(gname))
-
-
-
+# Create Dependent Variables 
+# Count total human rights violations
 full_model <- full_model %>%
   mutate(
     count_violations = rowSums(
       across(c(
-        rkillings_s,
-        rtorture_s,
-        rdetention_s,
-        rproperty_s,
-        rrecruitment_s,
-        rsexual_s,
-        rdisplace_s,
-        rrestrict_s
+        rkillings_s, rtorture_s, rdetention_s, rproperty_s,
+        rrecruitment_s, rsexual_s, rdisplace_s, rrestrict_s
       )),
       na.rm = TRUE
     ),
-
     discriminatory_score = rowSums(
       across(c(
-        rkillings_s,
-        rdetention_s,
-        rtorture_s,
-        rrecruitment_s,
-        rsexual_s
+        rkillings_s, rdetention_s, rtorture_s,
+        rrecruitment_s, rsexual_s
       )),
       na.rm = TRUE
     ),
-
     indiscriminate_score = rowSums(
-      across(c(
-        rproperty_s,
-        rdisplace_s,
-        rrestrict_s
-      )),
+      across(c(rproperty_s, rdisplace_s, rrestrict_s)),
       na.rm = TRUE
-    ),
-
-    # Organizational categories
-    civil_society = as.integer(
-      preorgmvt == 1 | preorgyou == 1 | preorglab == 1 | preorgrel == 1
-    ),
-    no_parorg = as.integer(
-      preorgeth == 1 | preorgref == 1 | preorgno == 1 | preorgoth == 1
-    ),
-    violent_parent = as.integer(
-      preorgmil == 1 |
-        preorgfmr == 1 |
-        preorgfor == 1 |
-        preorgter == 1 |
-        preorggov == 1 |
-        preorgreb == 1
-    ),
+    )
   )
 
 
+# Create Rebel Organization Variables 
+# Categorize types of parent organizations
+full_model <- full_model %>%
+  mutate(
+    civil_society = as.integer(
+      preorgmvt == 1 | preorgyou == 1 | 
+        preorglab == 1 | preorgrel == 1
+    ),
+    no_parorg = as.integer(
+      preorgeth == 1 | preorgref == 1 | 
+        preorgno == 1 | preorgoth == 1
+    ),
+    violent_parent = as.integer(
+      preorgmil == 1 | preorgfmr == 1 | preorgfor == 1 |
+        preorgter == 1 | preorggov == 1 | preorgreb == 1
+    )
+  )
 
-normalize_chr <- function(x) tolower(trimws(as.character(haven::as_factor(x))))
+
+# Convert Categorical Variables to Binary 
+# Normalize text labels and create binary indicators
+normalize_chr <- function(x) {
+  tolower(trimws(as.character(haven::as_factor(x))))
+}
 
 full_model <- full_model %>%
   mutate(
@@ -572,79 +388,54 @@ full_model <- full_model %>%
     centcontrol_chr = normalize_chr(centcontrol)
   ) %>%
   mutate(
-    rebelsupport_binary = ifelse(grepl("explicit", rebelsupport_chr), 1L, 0L),
-
+    rebelsupport_binary = ifelse(
+      grepl("explicit", rebelsupport_chr), 1L, 0L
+    ),
     rebstrength_binary = ifelse(
-      rebstrength_chr %in% c("stronger", "much stronger"),
-      1L,
+      rebstrength_chr %in% c("stronger", "much stronger"), 1L,
       ifelse(
         rebstrength_chr %in% c("weaker", "much weaker", "parity"),
-        0L,
-        NA_integer_
+        0L, NA_integer_
       )
     ),
-
     fightcap_binary = ifelse(
-      fightcap_chr %in% c("moderate", "high"),
-      1L,
+      fightcap_chr %in% c("moderate", "high"), 1L,
       ifelse(fightcap_chr %in% c("low"), 0L, NA_integer_)
     ),
-
     terrcont_binary = ifelse(
-      terrcont_chr %in% c("yes", "present", "1"),
-      1L,
+      terrcont_chr %in% c("yes", "present", "1"), 1L,
       ifelse(terrcont_chr %in% c("no", "0"), 0L, NA_integer_)
     ),
-
     centcontrol_binary = ifelse(
-      centcontrol_chr %in% c("yes", "present", "1"),
-      1L,
+      centcontrol_chr %in% c("yes", "present", "1"), 1L,
       ifelse(centcontrol_chr %in% c("no", "0"), 0L, NA_integer_)
     )
   )
 
-
-lapply(
-  c(
-    "rebelsupport_binary",
-    "rebstrength_binary",
-    "fightcap_binary",
-    "terrcont_binary",
-    "centcontrol_binary"
-  ),
-  \(v) table(full_model[[v]], useNA = "ifany")
-)
+# Converting main outcome to integer
+full_model <- full_model %>% 
+  mutate(violation_s = as.integer(violation_s))
 
 
-full_model <- full_model %>% mutate(violation_s = as.integer(violation_s))
-
-
-##########################################################################
-
-# Filter to complete cases for all variables
-
+# Create Final Analysis Dataset 
+# Keep only complete cases for regression analysis
 hr_model_corrected <- full_model %>%
   filter(if_all(
     c(
-      conflictid,
-      violation_s,
-      no_parorg,
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc
+      conflictid, violation_s, no_parorg, rebelsupport_binary,
+      terrcont_binary, fightcap_binary, rebstrength_binary,
+      ideology, merger, intensity, duration_years_ongoing,
+      vdem_edi, log_rgdppc
     ),
     ~ !is.na(.)
   ))
 
+
+
 # Check sample size
 nrow(hr_model_corrected)
+
+
 
 
 
@@ -792,16 +583,16 @@ print(descriptive_table)
 logit_model_corrected <- glm(
   violation_s ~
     no_parorg +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc,
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc,
   data = hr_model_corrected,
   family = binomial()
 )
@@ -841,16 +632,16 @@ hr_model_nreg <- full_model %>% # Fixed: removed "name" and used correct dataset
 nreg_model <- glm.nb(
   count_violations ~
     no_parorg +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc, # Fixed: consistent variables
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc, # Fixed: consistent variables
   data = hr_model_nreg,
   control = glm.control(maxit = 500)
 )
@@ -888,16 +679,16 @@ hr_model_nreg <- full_model %>% # Fixed: removed "name" and used correct dataset
 nreg_model <- glm.nb(
   count_violations ~
     no_parorg +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc, # Fixed: consistent variables
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc, # Fixed: consistent variables
   data = hr_model_nreg,
   control = glm.control(maxit = 500)
 )
@@ -1045,29 +836,29 @@ hr_model_zinb <- full_model %>% # Fixed: use correct dataset name
 zinb_model <- zeroinfl(
   count_violations ~
     no_parorg +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc | # Fixed: consistent variables
-
-      no_parorg +
-        rebelsupport_binary +
-        terrcont_binary +
-        fightcap_binary +
-        rebstrength_binary +
-        ideology +
-        merger +
-        intensity +
-        duration_years_ongoing +
-        vdem_edi +
-        log_rgdppc, # Fixed: consistent variables
-
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc | # Fixed: consistent variables
+    
+    no_parorg +
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc, # Fixed: consistent variables
+  
   data = hr_model_zinb,
   dist = "negbin"
 )
@@ -1120,16 +911,16 @@ hr_model_cs_logit <- full_model %>%
 logit_model_cs <- glm(
   violation_s ~
     civil_society +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc,
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc,
   data = hr_model_cs_logit,
   family = binomial()
 )
@@ -1177,16 +968,16 @@ hr_model_cs_nreg <- full_model %>%
 nreg_model_cs <- glm.nb(
   count_violations ~
     civil_society +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc,
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc,
   data = hr_model_cs_nreg,
   control = glm.control(maxit = 500)
 )
@@ -1397,29 +1188,29 @@ hr_model_cs_zinb <- full_model %>%
 zinb_model_cs <- zeroinfl(
   count_violations ~
     civil_society +
-      rebelsupport_binary +
-      terrcont_binary +
-      fightcap_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc |
-
-      civil_society +
-        rebelsupport_binary +
-        terrcont_binary +
-        fightcap_binary +
-        rebstrength_binary +
-        ideology +
-        merger +
-        intensity +
-        duration_years_ongoing +
-        vdem_edi +
-        log_rgdppc,
-
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc |
+    
+    civil_society +
+    rebelsupport_binary +
+    terrcont_binary +
+    fightcap_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc,
+  
   data = hr_model_cs_zinb,
   dist = "negbin"
 )
@@ -1442,16 +1233,16 @@ nrow(hr_model_cs_zinb)
 nreg_model_interact_cs <- glm.nb(
   count_violations ~
     civil_society *
-      fightcap_binary +
-      rebelsupport_binary +
-      terrcont_binary +
-      rebstrength_binary +
-      ideology +
-      merger +
-      intensity +
-      duration_years_ongoing +
-      vdem_edi +
-      log_rgdppc,
+    fightcap_binary +
+    rebelsupport_binary +
+    terrcont_binary +
+    rebstrength_binary +
+    ideology +
+    merger +
+    intensity +
+    duration_years_ongoing +
+    vdem_edi +
+    log_rgdppc,
   data = hr_model_cs_nreg, # Use the correctly filtered dataset
   control = glm.control(maxit = 500)
 )
@@ -1518,7 +1309,7 @@ violation_summary <- full_model %>%
     # Total violations by no_parorg groups
     violations_no_parorg = sum(count_violations[no_parorg == 1], na.rm = TRUE),
     violations_has_parorg = sum(count_violations[no_parorg == 0], na.rm = TRUE),
-
+    
     # Total violations by civil_society groups
     violations_civil_society = sum(
       count_violations[civil_society == 1],
@@ -1528,7 +1319,7 @@ violation_summary <- full_model %>%
       count_violations[civil_society == 0],
       na.rm = TRUE
     ),
-
+    
     # Total violations overall
     total_violations = sum(count_violations, na.rm = TRUE)
   ) %>%
