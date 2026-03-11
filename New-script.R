@@ -25,15 +25,13 @@ library(car)
 
 
 
-
 # ---- 2. Load Data ----
-humanrv   <- read_dta("newhrvio.dta") |> as_tibble()
-forge     <- read_dta("newforge_v1.0_public.dta") |> as_tibble()
-nsa_data  <- read_tsv("nsa_.asc") |> clean_names()
-wdi_raw <- readRDS("wdi_gdp_data_1989_2019.rds")
-vdem_raw  <- read_dta("V-Dem-CY-Core-v15.dta")
+humanrv   <- read_dta("data/raw/rhr (fresh).dta") |> as_tibble()
+forge     <- read_dta("data/raw/newforge_v1.0_public.dta") |> as_tibble()
+nsa_data  <- read_dta("data/raw/nsa_v3.4_21 copy.dta") |> as_tibble()
+wdi_raw   <- readRDS("data/raw/wdi_gdp_data_1989_2019.rds")
+vdem_raw  <- read_dta("data/raw/V-Dem-CY-Core-v15.dta")
 cat("✅ Data loaded successfully\n")
-
 
 
 
