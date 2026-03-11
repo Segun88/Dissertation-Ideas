@@ -1,1440 +1,1579 @@
 
-# ============================================================================
-# REBEL HUMAN RIGHTS VIOLATIONS: DATA PREPARATION SCRIPT
-# ============================================================================
 
-# Load Required Packages 
+# ============================================================
+# GROUP-YEAR LEVEL ANALYSIS SCRIPT (FULLY REVISED)
+# Improved GDP & V-Dem Coverage + Clean Variable Creation
+# ============================================================
+
+# ---- 1. Load Required Libraries ----
 library(haven)
 library(dplyr)
 library(tidyverse)
 library(janitor)
 library(WDI)
 library(ggplot2)
-library(broom)
 library(lmtest)
 library(modelsummary)
-library(kableExtra)
-library(ggeffects)
-library(stargazer)
 library(sandwich)
-library(AER)
-library(clubSandwich)
 library(MASS)
 library(lubridate)
-library(stringr)
-library(tibble)
 library(countrycode)
-library(pscl)
 library(marginaleffects)
+library(car)
 
 
-# Import Raw Datasets --------------------------------------------------------
-humanrv <- read_dta("rhr (realfresh).dta") |> as_tibble()
-nonstate <- read_dta("nsa_v3.4_21 copy.dta") |> as_tibble()
-forge <- read_dta("newforge_v1.0_public.dta") |> as_tibble()
-rebleader <- read_dta("ROLE 1.1 Final.dta") |> as_tibble()
 
 
-# Clean Variable Names -------------------------------------------------------
-nonstate <- nonstate %>% clean_names()
-forge <- forge %>% clean_names()
 
 
-# Standardize Key Identifiers ------------------------------------------------
-# Rename to ensure consistent dyad and rebel group IDs across datasets
-nonstate <- nonstate %>%
-  rename(
-    dyadid1 = dyadid,
-    sideb = side_b
+# ---- 2. Load Data ----
+humanrv   <- read_dta("newhrvio.dta") |> as_tibble()
+forge     <- read_dta("newforge_v1.0_public.dta") |> as_tibble()
+nsa_data  <- read_tsv("nsa_.asc") |> clean_names()
+wdi_raw <- readRDS("wdi_gdp_data_1989_2019.rds")
+vdem_raw  <- read_dta("V-Dem-CY-Core-v15.dta")
+cat("✅ Data loaded successfully\n")
+
+
+
+
+# NSA: Expand to Group-Year and Collapse
+# The NSA data arrives at the dyad level with start and end dates. 
+# Each dyad record is expanded into one row per year of activity, and then
+# collapsed so that each sideb x year combination has a single row.
+# =================================================================
+# PART A: NSA (expand to group-year, collapse)
+# ============================================================
+nsa_data <- nsa_data %>%
+  dplyr::rename(dyadid1 = dyadid, sideb = side_b)
+nsa_years <- nsa_data %>%
+  dplyr::mutate(
+    start_year = lubridate::year(lubridate::ymd(startdate)),
+    end_year   = lubridate::year(lubridate::ymd(enddate))
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(year = list(seq.int(start_year, end_year))) %>%
+  tidyr::unnest(year) %>%
+  dplyr::ungroup()
+nsa_year_clean <- nsa_years %>%
+  dplyr::mutate(
+    start_year = lubridate::year(lubridate::ymd(startdate)),
+    conflict_duration = year - start_year
+  ) %>%
+  dplyr::select(
+    dyadid1, sideb, year, startdate, enddate, conflict_duration,
+    rebestimate, rebstrength, centcontrol, fightcap, terrcont,
+    rebextpart, govextpart, rebel_support
+  ) %>%
+  dplyr::mutate(year = as.integer(year))
+order_rebstrength <- c("much stronger","stronger","parity","weaker","much weaker")
+order_fightcap    <- c("high","moderate","low")
+order_yesno       <- c("yes","present","1","no","0")
+nsa_year_collapsed <- nsa_year_clean %>%
+  dplyr::mutate(
+    rebstrength = factor(rebstrength, levels = order_rebstrength, ordered = TRUE),
+    fightcap    = factor(fightcap,    levels = order_fightcap,    ordered = TRUE),
+    terrcont    = factor(terrcont,    levels = order_yesno,       ordered = TRUE),
+    centcontrol = factor(centcontrol, levels = order_yesno,       ordered = TRUE)
+  ) %>%
+  dplyr::group_by(dyadid1, sideb, year) %>%
+  dplyr::summarise(
+    rebstrength       = suppressWarnings(max(rebstrength, na.rm = TRUE)),
+    fightcap          = suppressWarnings(max(fightcap,    na.rm = TRUE)),
+    terrcont          = suppressWarnings(max(terrcont,    na.rm = TRUE)),
+    centcontrol       = suppressWarnings(max(centcontrol, na.rm = TRUE)),
+    rebel_support     = dplyr::first(stats::na.omit(rebel_support)),
+    conflict_duration = suppressWarnings(max(conflict_duration, na.rm = TRUE)),
+    rebestimate       = suppressWarnings(max(rebestimate, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(c(rebstrength, fightcap, terrcont, centcontrol),
+                  ~na_if(as.character(.), "-Inf")),
+    year = as.integer(year)
   )
+cat("✅ NSA yearly data ready:", nrow(nsa_year_collapsed), "rows\n")
+glimpse(nsa_year_collapsed)
+head(nsa_year_collapsed, 5)
+nsa_year_clean |> count(sideb, year) |> filter(n > 1)
 
-forge <- forge %>%
-  rename(dyadid1 = ns_adyadid)
 
 
-# Select Variables from FORGE Dataset 
-# Keep only rebel group organizational characteristics
-forge_vars <- c(
-  "dyadid1", "sideb", "gname", "ccode", "cname", "conflict_id",
-  "foundyear", "ideology", "preorg", "preorgno", "preorgreb", "preorgter",
-  "preorgpar", "preorgmvt", "preorgyou", "preorglab", "preorgmil",
-  "preorggov", "preorgfmr", "preorgrel", "preorgfor", "preorgref",
-  "preorgeth", "preorgoth", "preorgname", "merger", "splinter"
-)
+
+
+
+## FORGE: Select Key Variables
+
+# FORGE provides the organizational origin data for each rebel group. 
+# Here, the dyad identifier is harmonized and the relevant parent-organization 
+# indicators needed for my research are only selected.
+
+
+# ============================================================
+# PART B: FORGE (select key vars)
+# ============================================================
+
+forge <- forge %>% dplyr::rename(dyadid1 = NSAdyadid)
+
+forge_vars <- c("dyadid1", "sideb", "gname", "ccode", "cname", "conflict_id",
+                "foundyear", "ideology", "preorg", "preorgno", "preorgreb",
+                "preorgter", "preorgpar", "preorgmvt", "preorgyou", "preorglab",
+                "preorgmil", "preorggov", "preorgfmr", "preorgrel", "preorgfor",
+                "preorgref", "preorgeth", "preorgoth", "preorgname", "merger", "splinter")
 
 forge_clean <- forge %>% dplyr::select(dplyr::any_of(forge_vars))
+cat("✅ FORGE data prepared:", nrow(forge_clean), "groups\n")
 
 
-# Select Variables from Non-State Actor Dataset 
-# Keep rebel capacity, territorial control, and external support variables
-nonstate_keep <- c(
-  "dyadid1", "sidea", "sideb", "startdate", "enddate",
-  "rebestimate", "rebestlow", "rebesthigh", "rebstrength",
-  "centcontrol", "strengthcent", "mobcap", "armsproc",
-  "fightcap", "terrcont", "effterrcont", "transconstsupp",
-  "rebextpart", "rebelsupport", "govsupport", "govextpart",
-  "typeoftermination", "victoryside"
-)
-
-nonstate_sel <- nonstate %>%
-  dplyr::select(dplyr::any_of(nonstate_keep)) %>%
-  rename(
-    start_ns = startdate,  # Rebel group start date
-    end_ns = enddate       # Rebel group end date
-  )
+glimpse(forge_clean)
+head(forge_clean, 5)
 
 
-# Merge FORGE and Non-State Actor Data 
-# Combine organizational characteristics with conflict dynamics
-forge_nonstate <- inner_join(
-  forge_clean,
-  nonstate_sel,
-  by = c("sideb", "dyadid1")
-) |>
-  as_tibble()
 
+## HRV: Collapse to Group-Year
 
-# Prepare Human Rights Violations Dataset 
+# The RHRV data contains event-level violation records. 
+# I aggregate this to group-year level by retaining the first non-missing 
+# identifier per group-year and the maximum reported severity for each violation type.
+
+# ============================================================
+# PART C: HRV (collapse to group-year)
+# ============================================================
+
 humanrv_clean <- humanrv %>%
   janitor::clean_names() %>%
   dplyr::rename(dyadid1 = dyadid)
 
+first_non_missing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) > 0) x[1] else NA
+}
 
-# Merge All Conflict Data 
-# Combine human rights violations with rebel organizational data
-hr_final <- left_join(humanrv_clean, forge_nonstate, by = c("sideb")) |>
-  as_tibble()
-
-# Clean up duplicate columns
-hr_final_clean <- hr_final |>
-  dplyr::select(-sidea.y) |>
-  rename(sidea = sidea.x)
-
-# Consolidate dyad IDs
-hr_final_clean <- hr_final_clean %>%
-  mutate(dyadid1 = dplyr::coalesce(dyadid1.x, dyadid1.y)) %>%
-  dplyr::select(-dplyr::any_of(c("dyadid1.x", "dyadid1.y")))
-
-
-# Calculate Conflict Duration
-# Convert dates to proper format
-hr_final_clean <- hr_final_clean %>%
-  mutate(
-    start_ns = as.Date(start_ns),
-    end_ns = as.Date(end_ns)
-  )
-
-# Find earliest start date for each rebel group
-group_start <- hr_final_clean %>%
-  group_by(dyadid1, sidea, sideb) %>%
-  summarise(
-    min_start_ns = suppressWarnings(min(start_ns, na.rm = TRUE)),
-    first_year = suppressWarnings(min(year, na.rm = TRUE)),
+hrv_cy <- humanrv_clean %>%
+  dplyr::group_by(dyadid1, sideb, year) %>%
+  dplyr::summarize(
+    intensity   = first_non_missing(intensity),
+    osv         = first_non_missing(osv),
+    osv_dummy   = first_non_missing(osv_dummy),
+    conflictid  = first_non_missing(conflictid),
+    sidebid     = first_non_missing(sidebid),
+    location    = first_non_missing(location),
+    sidea       = first_non_missing(sidea),
+    violation_s = suppressWarnings(max(violation_s,   na.rm = TRUE)),
+    rkillings_s = suppressWarnings(max(rkillings_s,   na.rm = TRUE)),
+    rtorture_s  = suppressWarnings(max(rtorture_s,    na.rm = TRUE)),
+    rdetention_s= suppressWarnings(max(rdetention_s,  na.rm = TRUE)),
+    rproperty_s = suppressWarnings(max(rproperty_s,   na.rm = TRUE)),
+    rrecruitment_s = suppressWarnings(max(rrecruitment_s, na.rm = TRUE)),
+    rsexual_s   = suppressWarnings(max(rsexual_s,     na.rm = TRUE)),
+    rdisplace_s = suppressWarnings(max(rdisplace_s,   na.rm = TRUE)),
+    rrestrict_s = suppressWarnings(max(rrestrict_s,   na.rm = TRUE)),
     .groups = "drop"
   ) %>%
-  mutate(
-    min_start_ns = as.Date(ifelse(
-      is.finite(as.numeric(min_start_ns)),
-      min_start_ns,
-      NA
-    ))
-  ) %>%
-  mutate(
-    start_group = coalesce(
-      min_start_ns,
-      as.Date(sprintf("%d-01-01", first_year))
-    )
-  ) %>%
-  dplyr::select(dyadid1, sidea, sideb, start_group)
-
-# Calculate duration measures
-hr_final_clean <- hr_final_clean %>%
-  left_join(group_start, by = c("dyadid1", "sidea", "sideb")) %>%
-  mutate(
-    obs_end_of_year = as.Date(sprintf("%d-12-31", year)),
-    duration_years_ongoing = as.numeric(
-      pmax(obs_end_of_year, start_group) - start_group
-    ) / 365.25,
-    conflict_duration_days = as.numeric(ifelse(
-      !is.na(end_ns),
-      end_ns - start_group,
-      NA
-    )),
-    conflict_duration_years = conflict_duration_days / 365.25
+  dplyr::mutate(
+    dplyr::across(c(violation_s, rkillings_s, rtorture_s, rdetention_s,
+                    rproperty_s, rrecruitment_s, rsexual_s, rdisplace_s, rrestrict_s),
+                  ~ ifelse(is.infinite(.), NA_real_, as.integer(.))),
+    year = as.integer(year)
   )
 
-# Keep only observations with valid duration
-analysis_df <- hr_final_clean %>% filter(!is.na(duration_years_ongoing))
+cat("✅ HRV group-year data ready:", nrow(hrv_cy), "rows\n")
+
+hrv_cy %>% count(sideb, year) %>% filter(n>1)
 
 
-# Standardize Country Names to ISO3 Codes 
-humanrv_aug <- hr_final_clean %>%
-  mutate(
-    sidea_std = str_squish(sidea),
-    iso3c = countrycode(sidea_std, "country.name", "iso3c")
-  ) %>%
-  mutate(
-    iso3c = case_when(
-      sidea_std %in% c("Congo (Kinshasa)", "DR Congo", 
-                       "Democratic Republic of the Congo",
-                       "Congo, Dem. Rep.", 
-                       "Congo, Democratic Republic of") ~ "COD",
-      sidea_std %in% c("Congo (Brazzaville)", 
-                       "Republic of the Congo", "Congo") ~ "COG",
-      sidea_std %in% c("Ivory Coast", "Cote d'Ivoire", 
-                       "Côte d'Ivoire") ~ "CIV",
-      sidea_std %in% c("Eswatini", "Swaziland") ~ "SWZ",
-      sidea_std %in% c("Burma", "Myanmar") ~ "MMR",
-      sidea_std %in% c("Russia", "Russian Federation") ~ "RUS",
-      sidea_std %in% c("Iran", "Iran (Islamic Republic of)") ~ "IRN",
-      sidea_std %in% c("Syria", "Syrian Arab Republic") ~ "SYR",
-      sidea_std %in% c("Laos", "Lao PDR", 
-                       "Lao People's Democratic Republic") ~ "LAO",
-      sidea_std %in% c("Yemen (North Yemen)", "North Yemen", 
-                       "Yemen Arab Republic") ~ "YEM",
-      TRUE ~ iso3c
-    )
-  )
-
-# Checking all observations have country codes
-if (anyNA(humanrv_aug$iso3c)) {
-  stop("Some ISO3C codes are missing. Inspect with: 
-       humanrv_aug %>% filter(is.na(iso3c)) %>% distinct(sidea_std)")
-}
+glimpse(hrv_cy)
+head(hrv_cy, 5)
 
 
-# Add GDP Per Capita Data 
-# Download World Bank GDP data
-wdi_raw <- WDI(
-  country = "all",
-  indicator = c(gdppc_const2015 = "NY.GDP.PCAP.KD"),
-  start = 1990,
-  end = 2023,
-  extra = TRUE
+
+
+# In this section, I continued the wrangling by continuing the merging of 
+# datasets. I incorporated the GDP and V-dem datasets while merging 
+# with other datasets.
+
+## Merge HRV + FORGE + NSA into a Unique Group-Year Panel
+
+# ============================================================
+# PART D: Merge HRV + FORGE + NSA (unique group-year) ALL DUPLICATES REMOVED
+# ============================================================
+
+# Step 1: HRV left-join FORGE (static origin data onto group-year violations)
+panel_step1 <- hrv_cy %>%
+  dplyr::left_join(forge_clean, by = "sideb")
+
+panel_step1_unique <- panel_step1 %>%
+  dplyr::group_by(sideb, year) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), ~ dplyr::first(stats::na.omit(.))),
+                   .groups = "drop")
+
+# Step 2: Collapse NSA to unique sideb-year
+nsa_year_unique <- nsa_year_collapsed %>%
+  dplyr::group_by(sideb, year) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), ~ dplyr::first(stats::na.omit(.))),
+                   .groups = "drop")
+
+# Step 3: Left-join NSA capability data
+newpanel_final <- panel_step1_unique %>%
+  dplyr::left_join(nsa_year_unique, by = c("sideb", "year")) %>%
+  dplyr::mutate(year = as.integer(year)) %>%
+  tibble::as_tibble()
+
+print(paste("After merging HRV + FORGE + NSA:", nrow(newpanel_final), "rows"))
+
+
+glimpse(newpanel_final)
+head(newpanel_final, 5)
+
+
+# Quick dup check
+dup_keys <- newpanel_final %>%
+  dplyr::count(sideb, year) %>% dplyr::filter(n > 1)
+if (nrow(dup_keys) > 0) message("⚠️ Duplicates remain in (sideb,year).")
+
+
+
+
+
+## GDP (WDI): Country-Code Harmonization, Merge, and Interpolation
+
+# Merging GDP data requires translating COW country codes 
+#(used in the conflict data) to ISO3C codes (used by the World Bank). 
+# After merging, linear interpolation fills within-country gaps in GDP coverage.
+
+# ============================================================
+# PART E: GDP (WDI) — build ISO3C, merge, interpolate
+# ============================================================
+# Build ISO3C from COW codes with fallback from country names
+custom_match <- c(
+  "DR Congo (Zaire)" = "COD", "DR Congo" = "COD",
+  "Congo (Kinshasa)" = "COD", "Yemen (North Yemen)" = "YEM",
+  "Serbia (Yugoslavia)" = "SRB", "Russia (Soviet Union)" = "RUS",
+  "Macedonia, FYR" = "MKD", "Bosnia-Herzegovina" = "BIH",
+  "Myanmar (Burma)" = "MMR", "South Sudan" = "SSD"
 )
 
+newpanel_final <- newpanel_final %>%
+  dplyr::mutate(
+    ccode      = suppressWarnings(as.integer(ccode)),
+    iso3c_ccode = countrycode(ccode, "cown", "iso3c", warn = FALSE),
+    sidea_clean = stringr::str_squish(sidea),
+    iso3c_name  = countrycode(sidea_clean, "country.name", "iso3c",
+                              warn = FALSE, custom_match = custom_match),
+    iso3c       = dplyr::coalesce(iso3c_ccode, iso3c_name)
+  )
+
+# Clean and merge WDI GDP data
 wdi_clean <- wdi_raw %>%
-  transmute(iso3c = iso3c, year = year, gdppc_const2015) %>%
-  filter(!is.na(iso3c), !is.na(year))
+  dplyr::transmute(iso3c = iso3c, year = as.integer(year), gdppc_const2015) %>%
+  dplyr::filter(!is.na(iso3c), !is.na(year), !is.na(gdppc_const2015))
 
-# Merge GDP data
-hr_with_gdp <- humanrv_aug %>%
-  left_join(wdi_clean, by = c("iso3c", "year"))
+newpanel_final <- newpanel_final %>%
+  dplyr::select(-dplyr::any_of(c("gdp_pc","log_gdp_pc","gdppc_const2015"))) %>%
+  dplyr::left_join(wdi_clean, by = c("iso3c","year"))
 
-# Fill missing GDP values with linear interpolation
-wdi_series <- hr_with_gdp %>%
-  distinct(iso3c, year, gdppc_const2015) %>%
-  arrange(iso3c, year)
-
-wdi_filled <- wdi_series %>%
-  group_by(iso3c) %>%
-  mutate(
-    gdppc_const2015_filled = {
-      y <- gdppc_const2015
-      x <- year
+# Linear interpolation within country to fill GDP gaps
+wdi_filled <- newpanel_final %>%
+  dplyr::distinct(iso3c, year, gdppc_const2015) %>%
+  dplyr::arrange(iso3c, year) %>%
+  dplyr::group_by(iso3c) %>%
+  dplyr::mutate(
+    gdppc_filled = {
+      y <- gdppc_const2015; x <- year
       if (sum(!is.na(y)) >= 2) {
-        approx(
-          x = x[!is.na(y)],
-          y = y[!is.na(y)],
-          xout = x,
-          method = "linear",
-          rule = 2
-        )$y
-      } else {
-        y
-      }
+        approx(x = x[!is.na(y)], y = y[!is.na(y)], xout = x,
+               method = "linear", rule = 1)$y
+      } else y
     }
   ) %>%
-  ungroup()
+  dplyr::ungroup() %>%
+  dplyr::select(iso3c, year, gdppc_filled)
 
-hr_with_gdp_filled <- hr_with_gdp %>%
-  left_join(
-    wdi_filled %>% dplyr::select(iso3c, year, gdppc_const2015_filled),
-    by = c("iso3c", "year")
-  )
+newpanel_final <- newpanel_final %>%
+  dplyr::select(-gdppc_const2015) %>%
+  dplyr::left_join(wdi_filled, by = c("iso3c","year")) %>%
+  dplyr::rename(gdp_pc = gdppc_filled) %>%
+  dplyr::mutate(log_gdp_pc = log(gdp_pc))
 
 
-# Add Democracy Data (V-Dem) 
-# Import V-Dem democracy indicators
-vdem_raw <- read_dta("V-Dem-CY-Core-v15.dta")
 
-vdem_keep <- vdem_raw %>%
+
+
+# V-Dem polyarchy scores are matched to the panel via ISO3C 
+#country codes and year.
+
+# ============================================================
+# PART F: V-Dem (democracy) — ISO3C match and merge
+# ============================================================
+
+vdem_clean <- vdem_raw %>%
   dplyr::select(year, COWcode, v2x_polyarchy) %>%
-  mutate(
+  dplyr::mutate(
     year = as.integer(year),
     cown = suppressWarnings(as.integer(COWcode)),
-    iso3c = countrycode(cown, "cown", "iso3c"),
-    v2x_polyarchy = as.numeric(v2x_polyarchy)
+    iso3c = countrycode(cown, "cown", "iso3c", warn = FALSE),
+    democracy = as.numeric(v2x_polyarchy)
   ) %>%
-  filter(!is.na(iso3c), !is.na(year)) %>%
-  dplyr::select(year, iso3c, v2x_polyarchy)
+  dplyr::filter(!is.na(iso3c), !is.na(year), !is.na(democracy),
+                year >= 1989, year <= 2019) %>%
+  dplyr::select(iso3c, year, democracy)
 
-# Merge democracy data and create analysis variables
-hr_model_ready <- hr_with_gdp_filled %>%
-  left_join(vdem_keep, by = c("iso3c", "year")) %>%
-  mutate(
-    log_rgdppc = log(gdppc_const2015_filled),
-    vdem_edi = v2x_polyarchy,
-    vdem_edi_z = as.numeric(scale(vdem_edi)),
-    dem_dummy_vdem = if_else(!is.na(vdem_edi) & vdem_edi >= 0.5, 1L, 0L)
-  ) %>%
-  relocate(
-    sidea, sideb, year, iso3c,
-    log_rgdppc, vdem_edi, vdem_edi_z, dem_dummy_vdem
+newpanel_final <- newpanel_final %>%
+  dplyr::left_join(vdem_clean, by = c("iso3c","year")) %>%
+  dplyr::mutate(
+    democracy_z = as.numeric(scale(democracy)),
+    democracy_high = as.integer(!is.na(democracy) & democracy >= 0.5)
   )
 
-# Check data coverage
-diag <- hr_model_ready %>%
-  summarise(
-    rows = n(),
-    gdp_nonmissing = sum(!is.na(gdppc_const2015_filled)),
-    vdem_nonmiss = sum(!is.na(vdem_edi)),
-    gdp_cover_pct = mean(!is.na(gdppc_const2015_filled)) * 100,
-    vdem_cover_pct = mean(!is.na(vdem_edi)) * 100
-  )
-print(diag)
 
 
-# Final Data Cleaning 
-full_model <- hr_model_ready
-
-# Remove duplicate columns
-full_model <- full_model %>%
-  dplyr::select(-tidyselect::any_of(c("dyadid1.y", "startdate.y", "sidea.y")))
-
-# Rename .x columns to clean names
-if ("dyadid1.x" %in% names(full_model)) {
-  full_model <- dplyr::rename(full_model, dyadid1 = dyadid1.x)
-}
-if ("startdate.x" %in% names(full_model)) {
-  full_model <- dplyr::rename(full_model, startdate = startdate.x)
-}
-if ("sidea.x" %in% names(full_model)) {
-  full_model <- dplyr::rename(full_model, sidea = sidea.x)
-}
-
-# Verifying if required variables exist
-stopifnot(all(c("sidea", "sideb", "year", "dyadid1") %in% names(full_model)))
-
-# Check for duplicate observations
-dupe_key <- full_model %>%
-  dplyr::count(sidea, sideb, year, name = "n") %>%
-  dplyr::filter(n > 1)
-
-if (nrow(dupe_key) > 0) {
-  message("WARNING: Duplicate (sidea, sideb, year) rows detected.")
-  print(head(dupe_key, 10))
-} else {
-  message("OK: No duplicate (sidea, sideb, year) rows.")
-}
 
 
-# Create Dependent Variables 
-# Count total human rights violations
-full_model <- full_model %>%
+
+# ============================================================
+# PART G: Final coverage summary
+# ============================================================
+
+newpanel_final %>%
+  dplyr::summarise(
+    total_rows = dplyr::n(),
+    gdp_coverage = round(mean(!is.na(gdp_pc)) * 100, 1),
+    democracy_coverage = round(mean(!is.na(democracy)) * 100, 1),
+    both_coverage = round(mean(!is.na(gdp_pc) & !is.na(democracy)) * 100, 1)
+  ) %>%
+  print()
+
+
+
+
+
+# ============================================================
+# PART H: CREATE VIOLATION COUNT VARIABLE
+# ============================================================
+
+# ---- 9. Create Violation Count ----
+viol_vars <- c("rkillings_s", "rtorture_s", "rdetention_s", "rproperty_s",
+               "rrecruitment_s", "rsexual_s", "rdisplace_s", "rrestrict_s")
+
+newpanel_final <- newpanel_final %>%
   mutate(
-    count_violations = rowSums(
-      across(c(
-        rkillings_s, rtorture_s, rdetention_s, rproperty_s,
-        rrecruitment_s, rsexual_s, rdisplace_s, rrestrict_s
-      )),
-      na.rm = TRUE
-    ),
-    discriminatory_score = rowSums(
-      across(c(
-        rkillings_s, rdetention_s, rtorture_s,
-        rrecruitment_s, rsexual_s
-      )),
-      na.rm = TRUE
-    ),
-    indiscriminate_score = rowSums(
-      across(c(rproperty_s, rdisplace_s, rrestrict_s)),
-      na.rm = TRUE
+    violation_count = rowSums(across(all_of(viol_vars), ~ as.integer(. >= 1)), na.rm = TRUE)
+  )
+
+
+
+
+# ============================================================
+# PART I: FILTER TO COMPLETE CASES AND CREATE MODEL BASE
+# ============================================================
+
+
+# Observations with missing key rebel capability measures are 
+# however dropped to form the analytic base.
+
+# ---- 10. Filter to Complete Cases ----
+model_base <- newpanel_final %>%
+  filter(!is.na(rebstrength) & !is.na(terrcont))
+
+print(paste("After filtering NSA variables:", nrow(model_base), "rows"))
+
+glimpse(model_base)
+head(model_base, 5)
+
+
+
+
+## Create Origin Variables
+
+### Broad Parent Organization Categories
+
+# Each FORGE parent-organization indicator is recoded to 0/1, then grouped into 
+# four broad origin types: civil society, violent/military parent, political party, 
+# and no parent organization.
+
+
+# ============================================================
+# PART J: CREATE ORIGIN VARIABLES
+# ============================================================
+
+# ---- 11. Initialize Parent Organization Variables ----
+model_base <- model_base %>%
+  mutate(
+    across(
+      c(preorgmvt, preorgyou, preorglab, preorgrel, 
+        preorgeth, preorgref, preorgno, preorgoth,
+        preorgmil, preorgfmr, preorgfor, preorgter, 
+        preorggov, preorgreb, preorgpar),
+      ~ replace_na(as.integer(.), 0L)
     )
   )
 
 
-# Create Rebel Organization Variables 
-# Categorize types of parent organizations
-full_model <- full_model %>%
+
+# ---- 12. Create Broad Parent Organization Categories ----
+model_base <- model_base %>%
   mutate(
+    # Civil society origins
     civil_society = as.integer(
-      preorgmvt == 1 | preorgyou == 1 | 
-        preorglab == 1 | preorgrel == 1
+      preorgmvt == 1L | preorgyou == 1L | preorglab == 1L | preorgrel == 1L
     ),
+    
+    # No formal parent organization
     no_parorg = as.integer(
-      preorgeth == 1 | preorgref == 1 | 
-        preorgno == 1 | preorgoth == 1
+      preorgeth == 1L | preorgref == 1L | preorgno == 1L | preorgoth == 1L
     ),
+    
+    # Violent/armed parent
     violent_parent = as.integer(
-      preorgmil == 1 | preorgfmr == 1 | preorgfor == 1 |
-        preorgter == 1 | preorggov == 1 | preorgreb == 1
+      preorgmil == 1L | preorgfmr == 1L | preorgfor == 1L | 
+        preorgter == 1L | preorgreb == 1L
+    ),
+    
+    # Political party origin
+    political_party = as.integer(preorgpar == 1L),
+    
+    # Government faction origin
+    govt_faction = as.integer(preorggov == 1L),
+    
+    # Detailed violent origin subcategories
+    military_origin = as.integer(preorgmil == 1 | preorgfmr == 1),
+    armed_nonstate_origin = as.integer(preorgreb == 1 | preorgter == 1),
+    foreign_armed_origin = as.integer(preorgfor == 1)
+  )
+
+
+
+# ---- 13. Create Mutually Exclusive Origin Categories ----
+model_base <- model_base %>%
+  mutate(
+    # Exclusive categories (no overlap)
+    civil_only = as.integer(
+      civil_society == 1 & violent_parent == 0 & 
+        no_parorg == 0 & political_party == 0 & govt_faction == 0
+    ),
+    
+    violent_only = as.integer(
+      violent_parent == 1 & civil_society == 0 & 
+        no_parorg == 0 & political_party == 0 & govt_faction == 0
+    ),
+    
+    no_parent_only = as.integer(
+      no_parorg == 1 & civil_society == 0 & 
+        violent_parent == 0 & political_party == 0 & govt_faction == 0
+    ),
+    
+    political_party_only = as.integer(
+      political_party == 1 & civil_society == 0 & 
+        violent_parent == 0 & no_parorg == 0 & govt_faction == 0
+    ),
+    
+    govt_faction_only = as.integer(
+      govt_faction == 1 & civil_society == 0 & 
+        violent_parent == 0 & no_parorg == 0 & political_party == 0
+    ),
+    
+    # Mixed origins (for tracking, not analysis)
+    mixed_origin = as.integer(
+      (civil_society + violent_parent + no_parorg + political_party + govt_faction) > 1
     )
   )
 
 
-# Convert Categorical Variables to Binary 
-# Normalize text labels and create binary indicators
-normalize_chr <- function(x) {
-  tolower(trimws(as.character(haven::as_factor(x))))
+
+
+
+# ---- 14. Create Mutually Exclusive Detailed Violent Subcategories ----
+model_base <- model_base %>%
+  mutate(
+    military_only = as.integer(
+      violent_only == 1 & military_origin == 1 & 
+        armed_nonstate_origin == 0 & foreign_armed_origin == 0
+    ),
+    
+    armed_nonstate_only = as.integer(
+      violent_only == 1 & armed_nonstate_origin == 1 & 
+        military_origin == 0 & foreign_armed_origin == 0
+    ),
+    
+    foreign_armed_only = as.integer(
+      violent_only == 1 & foreign_armed_origin == 1 & 
+        military_origin == 0 & armed_nonstate_origin == 0
+    ),
+    
+    mixed_violent = as.integer(
+      violent_only == 1 & 
+        (military_origin + armed_nonstate_origin + foreign_armed_origin) > 1
+    )
+  )
+
+
+
+
+
+
+
+
+## Create Dependent Variables: Discriminatory vs. Indiscriminate Violence
+
+#Violation types are classified into two conceptual groups. 
+# Binary indicators, variety counts, severity scores, 
+# and compositional shares are all constructed.
+
+
+# ============================================================
+# PART K: CREATE DISCRIMINATORY/INDISCRIMINATE VIOLENCE VARIABLES
+# ============================================================
+# ---- 15. Create Discriminatory and Indiscriminate DVs ----
+model_base <- model_base %>%
+  mutate(
+    # Convert ordinal to binary (ever violated)
+    killings_binary = as.integer(rkillings_s >= 1),
+    detention_binary = as.integer(rdetention_s >= 1),
+    torture_binary = as.integer(rtorture_s >= 1),
+    recruitment_binary = as.integer(rrecruitment_s >= 1),
+    sexual_binary = as.integer(rsexual_s >= 1),
+    displace_binary = as.integer(rdisplace_s >= 1),
+    restrict_binary = as.integer(rrestrict_s >= 1),
+    property_binary = as.integer(rproperty_s >= 1),
+    
+    # Composite binary measures
+    discriminatory_binary = as.integer(
+      killings_binary == 1 | detention_binary == 1 | torture_binary == 1
+    ),
+    indiscriminate_binary = as.integer(
+      recruitment_binary == 1 | sexual_binary == 1 | displace_binary == 1 | 
+        restrict_binary == 1 | property_binary == 1
+    ),
+    
+    # Variety counts (0-3 for discriminatory, 0-5 for indiscriminate)
+    discriminatory_variety = killings_binary + detention_binary + torture_binary,
+    indiscriminate_variety = recruitment_binary + sexual_binary + displace_binary + 
+      restrict_binary + property_binary,
+    
+    # H2: LEVEL OF VIOLATIONS (Total variety and severity)
+    total_variety = discriminatory_variety + indiscriminate_variety,  # 0-8 scale
+    total_severity = (rkillings_s + rdetention_s + rtorture_s) + 
+      (rrecruitment_s + rsexual_s + rdisplace_s + 
+         rrestrict_s + rproperty_s),  # 0-16 scale
+    any_violation = as.integer(total_variety > 0),  # Binary: 0/1
+    
+    # H1: PATTERN OF VIOLATIONS (Discriminatory share)
+    violence_share_disc = if_else(
+      total_variety > 0,
+      discriminatory_variety / total_variety,
+      NA_real_
+    ),
+    
+    # ALTERNATIVE MEASURES
+    # Violence ratio
+    
+    violence_ratio_smooth = (discriminatory_variety + 1) / (indiscriminate_variety + 1),
+    
+    
+    # Violence difference (normalized for different scales)
+    violence_diff = discriminatory_variety - (5/3) * indiscriminate_variety,
+    
+    # Individual severity scores (for reference)
+    discriminatory_severity = rkillings_s + rdetention_s + rtorture_s,
+    indiscriminate_severity = rrecruitment_s + rsexual_s + rdisplace_s + 
+      rrestrict_s + rproperty_s
+  )
+
+
+
+
+
+
+# ============================================================
+# PART N: CHECK DV DISTRIBUTIONS 
+# ============================================================
+
+# Violence share (H1)
+summary(model_base$violence_share_disc)
+table(cut(model_base$violence_share_disc, 
+          breaks = c(0, 0.25, 0.5, 0.75, 1.0),
+          include.lowest = TRUE,
+          labels = c("Mostly Indiscrim (0-25%)", "Mixed-Indiscrim (25-50%)", 
+                     "Mixed-Discrim (50-75%)", "Mostly Discrim (75-100%)")))
+
+# Total variety (H2)
+summary(model_base$total_variety)
+table(model_base$total_variety)
+
+# Total severity
+summary(model_base$total_severity)
+
+# Binary outcome
+table(model_base$any_violation)
+
+# Alternative measures
+summary(model_base$violence_ratio)
+summary(model_base$violence_diff)
+
+# Missing data
+sum(is.na(model_base$violence_share_disc))
+sum(!is.na(model_base$violence_share_disc))
+
+
+
+
+
+
+
+# ============================================================
+# PART L: CREATE CONTROL VARIABLES (ORDINAL VERSIONS)
+# ============================================================
+
+# Character-coded NSA variables are converted to ordered numeric scales 
+# for use in regression models.
+
+
+# Ensure ordered factors exist first
+order_rebstrength <- c("much weaker", "weaker", "parity", "stronger", "much stronger")
+order_fightcap <- c("low", "moderate", "high")
+order_terrcont <- c("no", "0", "yes", "present", "1")
+order_centcontrol <- c("no", "0", "yes", "present", "1")
+
+model_base <- model_base %>%
+  mutate(
+    # Create ordered factors from character versions
+    rebstrength_ordered = factor(rebstrength, levels = order_rebstrength, ordered = TRUE),
+    fightcap_ordered = factor(fightcap, levels = order_fightcap, ordered = TRUE),
+    terrcont_ordered = factor(terrcont, levels = order_terrcont, ordered = TRUE),
+    centcontrol_ordered = factor(centcontrol, levels = order_centcontrol, ordered = TRUE),
+    
+    # Convert to numeric (preserves ordinality)
+    rebstrength_num = as.numeric(rebstrength_ordered),      # 1-5
+    fightcap_num = as.numeric(fightcap_ordered),            # 1-3
+    terrcont_num = as.numeric(terrcont_ordered),            # Ordinal
+    centcontrol_num = as.numeric(centcontrol_ordered),      # Ordinal
+    
+    # Rebel support ordinal
+    rebel_support_num = case_when(
+      rebel_support == "explicit" ~ 2L,
+      rebel_support == "alleged" ~ 1L,
+      rebel_support == "no" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# Verify
+summary(model_base$rebstrength_num)
+summary(model_base$fightcap_num)
+summary(model_base$terrcont_num)
+summary(model_base$rebel_support_num)
+
+
+
+
+
+
+# ============================================================
+# PART M: FILTER TO ANALYSIS YEARS
+# ============================================================
+
+
+# Step 1 — Filter to analysis years first
+model_base <- model_base %>%
+  filter(year >= 1990, year <= 2018)
+
+
+
+
+
+
+#######################################################################
+
+# Step 2 — Then recode missing support
+model_base <- model_base %>%
+  mutate(
+    rebel_support_miss = as.integer(is.na(rebel_support_num)),
+    rebel_support_num  = replace_na(rebel_support_num, 0)
+  )
+
+# Step 3 — Verify
+sum(is.na(model_base$rebel_support_num))
+table(model_base$rebel_support_miss)
+
+
+############################################################################
+
+
+# Build Analytic Samples
+
+# Two mutually exclusive analytic samples 
+# are constructed for my proposed regression models.
+
+
+# ============================================================
+# SWITCHES (define these BEFORE running samples)
+# ============================================================
+DROP_MERGERS <- TRUE                 # TRUE = drop merger groups; FALSE = keep
+COMMUNITY_INCLUDES_PARTY <- TRUE     # TRUE = civil_society OR political_party; FALSE = civil_society only
+
+
+
+
+
+# ============================================================
+# SAFETY: make sure key indicators are 0/1 and non-missing
+# ============================================================
+req_vars <- c(
+  "merger",
+  "civil_society","political_party","violent_parent",
+  "preorgno","preorgeth","preorgref","preorgoth",
+  "civil_only","violent_only","no_parent_only","political_party_only"
+)
+
+missing_vars <- setdiff(req_vars, names(model_base))
+if (length(missing_vars) > 0) stop("Missing variables in model_base: ", paste(missing_vars, collapse = ", "))
+
+# This safety check verifies that `model_base` contains all 12 
+# required origin variables before running the analysis. 
+# If any variables are missing, the script immediately stops with an error message listing what's missing.
+
+
+
+
+
+
+# ============================================================
+# Build origin_clean in model_base (4-category label)
+# ============================================================
+model_base <- model_base %>%
+  mutate(
+    origin_clean = case_when(
+      civil_only            == 1L ~ "Civil society origin",
+      violent_only          == 1L ~ "Violent/military origin",
+      political_party_only  == 1L ~ "Political party origin",
+      no_parent_only        == 1L ~ "No parent organization",
+      TRUE ~ NA_character_
+    ),
+    origin_clean = factor(
+      origin_clean,
+      levels = c("Violent/military origin",
+                 "Civil society origin",
+                 "Political party origin",
+                 "No parent organization")
+    )
+  )
+
+
+
+
+
+# ============================================================
+# Sample A: origin_3cat (violent vs civil vs noparent) — EXCLUSIVE
+# ============================================================
+
+model_data_all <- model_base %>%
+  { if (DROP_MERGERS) filter(., merger == 0L) else . } %>%
+  filter(civil_only + violent_only + no_parent_only == 1L) %>%
+  mutate(
+    origin_3cat = case_when(
+      violent_only   == 1L ~ "violent",
+      civil_only     == 1L ~ "civil",
+      no_parent_only == 1L ~ "noparent",
+      TRUE ~ NA_character_
+    ),
+    origin_3cat = factor(origin_3cat, levels = c("violent","civil","noparent"))
+  ) %>%
+  filter(!is.na(origin_3cat))
+
+
+
+
+# ============================================================
+# Sample B: origin_comm (violent vs community vs noparent) — EXCLUSIVE
+# ============================================================
+
+model_data_comm_broad <- model_base %>%
+  { if (DROP_MERGERS) filter(., merger == 0L) else . } %>%
+  mutate(
+    community_ties = if (COMMUNITY_INCLUDES_PARTY) {
+      as.integer(civil_society == 1L | political_party == 1L)
+    } else {
+      as.integer(civil_society == 1L)
+    },
+    no_parorg_broad = as.integer(preorgno == 1L | preorgeth == 1L | preorgref == 1L | preorgoth == 1L)
+  ) %>%
+  filter(community_ties + violent_parent + no_parorg_broad == 1L) %>%
+  mutate(
+    origin_comm = case_when(
+      violent_parent  == 1L ~ "violent",
+      community_ties  == 1L ~ "community",
+      no_parorg_broad == 1L ~ "noparent",
+      TRUE ~ NA_character_
+    ),
+    origin_comm = factor(origin_comm, levels = c("violent","community","noparent"))
+  ) %>%
+  filter(!is.na(origin_comm))
+
+
+
+
+
+# ============================================================
+# QUICK CHECKS 
+# ============================================================
+table(model_data_all$origin_3cat)
+table(model_data_comm_broad$origin_comm)
+
+model_data_comm_broad %>%
+  mutate(sum_check = community_ties + violent_parent + no_parorg_broad) %>%
+  count(sum_check)
+
+
+
+
+# ============================================================
+# REBEL GROUP ORIGINS AND HUMAN RIGHTS VIOLATIONS
+# Organized Analysis: No-Parent, Civil Society, Community Ties
+# ============================================================
+
+
+
+
+# Helper function for cluster-robust standard errors
+tidy_cluster <- function(model, cluster_var, conf = 0.95) {
+  V  <- vcovCL(model, cluster = cluster_var)
+  ct <- coeftest(model, vcov = V)
+  
+  is_lm <- inherits(model, "lm") && !inherits(model, "glm")
+  if (is_lm) {
+    crit <- qt(1 - (1 - conf) / 2, df = model$df.residual)
+  } else {
+    crit <- qnorm(1 - (1 - conf) / 2)
+  }
+  
+  tidy <- data.frame(
+    term      = rownames(ct),
+    estimate  = ct[, 1],
+    std.error = ct[, 2],
+    statistic = ct[, 3],
+    p.value   = ct[, 4],
+    stringsAsFactors = FALSE
+  ) |>
+    mutate(
+      conf.low  = estimate - crit * std.error,
+      conf.high = estimate + crit * std.error
+    )
+  
+  list(ct = ct, vcov = V, tidy = tidy)
 }
 
-full_model <- full_model %>%
+
+
+
+# ============================================================
+# SECTION 1: PARENTLESS ORIGIN
+# Reference = All other origin types combined
+# Sample: model_data_noparent (full model_base)
+# ============================================================
+
+# --- Fractional Logit: Violence Share ---
+m1_nopar_share <- glm(
+  violence_share_disc ~ no_parent + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_noparent %>% filter(!is.na(violence_share_disc)),
+  family = quasibinomial("logit")
+)
+r1_nopar_share <- tidy_cluster(m1_nopar_share, ~sideb)
+r1_nopar_share$ct
+nobs(m1_nopar_share)
+
+# --- Binomial Composition: cbind (violators only) ---
+df_nopar_pattern <- model_data_noparent %>%
+  filter(total_variety > 0) %>%
   mutate(
-    rebelsupport_chr = normalize_chr(rebelsupport),
-    rebstrength_chr = normalize_chr(rebstrength),
-    fightcap_chr = normalize_chr(fightcap),
-    terrcont_chr = normalize_chr(terrcont),
-    centcontrol_chr = normalize_chr(centcontrol)
-  ) %>%
+    disc_count   = as.integer(discriminatory_variety),
+    indisc_count = as.integer(indiscriminate_variety)
+  )
+
+m1_nopar_pattern <- glm(
+  cbind(disc_count, indisc_count) ~ no_parent +
+    log_gdp_pc + democracy_z + ideology +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  family = binomial("logit"),
+  data   = df_nopar_pattern
+)
+r1_nopar_pattern <- tidy_cluster(m1_nopar_pattern, ~sideb)
+r1_nopar_pattern$ct
+nobs(m1_nopar_pattern)
+
+# --- Binary: Any Violation ---
+m1_nopar_anyviol <- glm(
+  violation_s ~ no_parent + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_noparent,
+  family = binomial("logit")
+)
+r1_nopar_anyviol <- tidy_cluster(m1_nopar_anyviol, ~sideb)
+r1_nopar_anyviol$ct
+nobs(m1_nopar_anyviol)
+
+# --- Binary: Discriminatory ---
+m1_nopar_disc_bin <- glm(
+  discriminatory_binary ~ no_parent + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_noparent,
+  family = binomial("logit")
+)
+r1_nopar_disc_bin <- tidy_cluster(m1_nopar_disc_bin, ~sideb)
+r1_nopar_disc_bin$ct
+nobs(m1_nopar_disc_bin)
+
+# --- Binary: Indiscriminate ---
+m1_nopar_indisc_bin <- glm(
+  indiscriminate_binary ~ no_parent + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_noparent,
+  family = binomial("logit")
+)
+r1_nopar_indisc_bin <- tidy_cluster(m1_nopar_indisc_bin, ~sideb)
+r1_nopar_indisc_bin$ct
+nobs(m1_nopar_indisc_bin)
+
+# --- Count: Total Variety ---
+m1_nopar_total <- glm.nb(
+  total_variety ~ no_parent + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent
+)
+r1_nopar_total <- tidy_cluster(m1_nopar_total, ~sideb)
+r1_nopar_total$ct
+nobs(m1_nopar_total)
+
+# --- Count: Discriminatory Variety ---
+m1_nopar_disc_var <- glm.nb(
+  discriminatory_variety ~ no_parent + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent
+)
+r1_nopar_disc_var <- tidy_cluster(m1_nopar_disc_var, ~sideb)
+r1_nopar_disc_var$ct
+nobs(m1_nopar_disc_var)
+
+# --- Count: Indiscriminate Variety ---
+m1_nopar_indisc_var <- glm.nb(
+  indiscriminate_variety ~ no_parent + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent
+)
+r1_nopar_indisc_var <- tidy_cluster(m1_nopar_indisc_var, ~sideb)
+r1_nopar_indisc_var$ct
+nobs(m1_nopar_indisc_var)
+
+# --- Count: Discriminatory Severity ---
+m1_nopar_disc_sev <- glm.nb(
+  discriminatory_severity ~ no_parent + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent
+)
+r1_nopar_disc_sev <- tidy_cluster(m1_nopar_disc_sev, ~sideb)
+r1_nopar_disc_sev$ct
+nobs(m1_nopar_disc_sev)
+
+# --- Count: Indiscriminate Severity ---
+m1_nopar_indisc_sev <- glm.nb(
+  indiscriminate_severity ~ no_parent + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent
+)
+r1_nopar_indisc_sev <- tidy_cluster(m1_nopar_indisc_sev, ~sideb)
+r1_nopar_indisc_sev$ct
+nobs(m1_nopar_indisc_sev)
+
+# --- OLS: Violence Diff ---
+m1_nopar_diff <- lm(
+  violence_diff ~ no_parent + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_noparent %>% filter(!is.na(violence_share_disc))
+)
+r1_nopar_diff <- tidy_cluster(m1_nopar_diff, ~sideb)
+r1_nopar_diff$ct
+nobs(m1_nopar_diff)
+
+
+
+# ============================================================
+# SECTION 2: CIVIL SOCIETY (3-category)
+# Categories: Violent vs Civil vs Parentless
+# Reference = Violent origin
+# Sample: model_data_all (N=294)
+# ============================================================
+
+# --- Fractional Logit: Discriminatory Share ---
+m2_civil_share <- glm(
+  violence_share_disc ~ origin_3cat + log_gdp_pc  + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_all %>% filter(!is.na(violence_share_disc)),
+  family = quasibinomial("logit")
+)
+r2_civil_share <- tidy_cluster(m2_civil_share, ~sideb)
+r2_civil_share$ct
+nobs(m2_civil_share)
+
+
+# --- Fractional Logit: Indiscriminate Share ---
+m2_civil_indisc <- glm(
+  violence_share_indisc ~ origin_3cat + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_all %>% filter(!is.na(violence_share_indisc)),
+  family = quasibinomial("logit")
+)
+r2_civil_indisc <- tidy_cluster(m2_civil_indisc, ~sideb)
+r2_civil_indisc$ct
+nobs(m2_civil_indisc)
+
+# --- Binomial Composition: cbind (violators only) ---
+df_civil_pattern <- model_data_all %>%
+  filter(total_variety > 0) %>%
   mutate(
-    rebelsupport_binary = ifelse(
-      grepl("explicit", rebelsupport_chr), 1L, 0L
-    ),
-    rebstrength_binary = ifelse(
-      rebstrength_chr %in% c("stronger", "much stronger"), 1L,
-      ifelse(
-        rebstrength_chr %in% c("weaker", "much weaker", "parity"),
-        0L, NA_integer_
-      )
-    ),
-    fightcap_binary = ifelse(
-      fightcap_chr %in% c("moderate", "high"), 1L,
-      ifelse(fightcap_chr %in% c("low"), 0L, NA_integer_)
-    ),
-    terrcont_binary = ifelse(
-      terrcont_chr %in% c("yes", "present", "1"), 1L,
-      ifelse(terrcont_chr %in% c("no", "0"), 0L, NA_integer_)
-    ),
-    centcontrol_binary = ifelse(
-      centcontrol_chr %in% c("yes", "present", "1"), 1L,
-      ifelse(centcontrol_chr %in% c("no", "0"), 0L, NA_integer_)
-    )
+    disc_count   = as.integer(discriminatory_variety),
+    indisc_count = as.integer(indiscriminate_variety)
   )
 
-# Converting main outcome to integer
-full_model <- full_model %>% 
-  mutate(violation_s = as.integer(violation_s))
+m2_civil_pattern <- glm(
+  cbind(disc_count, indisc_count) ~ origin_3cat +
+    log_gdp_pc + democracy_z + ideology +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  family = binomial("logit"),
+  data   = df_civil_pattern
+)
+r2_civil_pattern <- tidy_cluster(m2_civil_pattern, ~sideb)
+r2_civil_pattern$ct
+nobs(m2_civil_pattern)
+
+# --- Binary: Any Violation ---
+m2_civil_anyviol <- glm(
+  violation_s ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_all,
+  family = binomial("logit")
+)
+r2_civil_anyviol <- tidy_cluster(m2_civil_anyviol, ~sideb)
+r2_civil_anyviol$ct
+nobs(m2_civil_anyviol)
+
+# --- Binary: Discriminatory ---
+m2_civil_disc_bin <- glm(
+  discriminatory_binary ~ origin_3cat + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_all,
+  family = binomial("logit")
+)
+r2_civil_disc_bin <- tidy_cluster(m2_civil_disc_bin, ~sideb)
+r2_civil_disc_bin$ct
+nobs(m2_civil_disc_bin)
+
+# --- Binary: Indiscriminate ---
+m2_civil_indisc_bin <- glm(
+  indiscriminate_binary ~ origin_3cat + ideology + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_all,
+  family = binomial("logit")
+)
+r2_civil_indisc_bin <- tidy_cluster(m2_civil_indisc_bin, ~sideb)
+r2_civil_indisc_bin$ct
+nobs(m2_civil_indisc_bin)
+
+# --- Count: Total Variety ---
+m2_civil_total <- glm.nb(
+  total_variety ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all
+)
+r2_civil_total <- tidy_cluster(m2_civil_total, ~sideb)
+r2_civil_total$ct
+nobs(m2_civil_total)
+
+# --- Count: Discriminatory Variety ---
+m2_civil_disc_var <- glm.nb(
+  discriminatory_variety ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all
+)
+r2_civil_disc_var <- tidy_cluster(m2_civil_disc_var, ~sideb)
+r2_civil_disc_var$ct
+nobs(m2_civil_disc_var)
+
+# --- Count: Indiscriminate Variety ---
+m2_civil_indisc_var <- glm.nb(
+  indiscriminate_variety ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all
+)
+r2_civil_indisc_var <- tidy_cluster(m2_civil_indisc_var, ~sideb)
+r2_civil_indisc_var$ct
+nobs(m2_civil_indisc_var)
+
+# --- Count: Discriminatory Severity ---
+m2_civil_disc_sev <- glm.nb(
+  discriminatory_severity ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all
+)
+r2_civil_disc_sev <- tidy_cluster(m2_civil_disc_sev, ~sideb)
+r2_civil_disc_sev$ct
+nobs(m2_civil_disc_sev)
+
+# --- Count: Indiscriminate Severity ---
+m2_civil_indisc_sev <- glm.nb(
+  indiscriminate_severity ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all
+)
+r2_civil_indisc_sev <- tidy_cluster(m2_civil_indisc_sev, ~sideb)
+r2_civil_indisc_sev$ct
+nobs(m2_civil_indisc_sev)
+
+# --- OLS: Violence Diff ---
+m2_civil_diff <- lm(
+  violence_diff ~ origin_3cat + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_all %>% filter(!is.na(violence_share_disc))
+)
+r2_civil_diff <- tidy_cluster(m2_civil_diff, ~sideb)
+r2_civil_diff$ct
+nobs(m2_civil_diff)
+
+# --- Violence Ratio ---
+m2_civil_ratio <- glm(
+  violence_ratio_smooth ~ origin_3cat + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  family = gaussian("log"),
+  data   = model_data_all %>% filter(!is.na(violence_ratio_smooth))
+)
+tidy_cluster(m2_civil_ratio, ~sideb)$ct
+nobs(m2_civil_ratio)
 
 
-# Create Final Analysis Dataset 
-# Keep only complete cases for regression analysis
-hr_model_corrected <- full_model %>%
-  filter(if_all(
-    c(
-      conflictid, violation_s, no_parorg, rebelsupport_binary,
-      terrcont_binary, fightcap_binary, rebstrength_binary,
-      ideology, merger, intensity, duration_years_ongoing,
-      vdem_edi, log_rgdppc
-    ),
-    ~ !is.na(.)
-  ))
+# ============================================================
+# SECTION 3: COMMUNITY TIES (3-category)
+# Categories: Violent vs Community (civil+party) vs Parentless
+# Reference = Violent origin
+# Sample: model_data_comm_broad (N=378)
+# ============================================================
 
+# --- Fractional Logit: Discriminatory Share ---
+m3_comm_share <- glm(
+  violence_share_disc ~ origin_comm + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_comm_broad %>% filter(!is.na(violence_share_disc)),
+  family = quasibinomial("logit")
+)
+r3_comm_share <- tidy_cluster(m3_comm_share, ~sideb)
+r3_comm_share$ct
+nobs(m3_comm_share)
 
+# --- Fractional Logit: Indiscriminate Share ---
+m3_comm_indisc <- glm(
+  violence_share_indisc ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_comm_broad %>% filter(!is.na(violence_share_indisc)),
+  family = quasibinomial("logit")
+)
+r3_comm_indisc <- tidy_cluster(m3_comm_indisc, ~sideb)
+r3_comm_indisc$ct
+nobs(m3_comm_indisc)
 
-# Check sample size
-nrow(hr_model_corrected)
-
-
-
-
-
-
-# Descriptive statistics table
-descriptive_stats <- hr_model_corrected %>%
-  summarise(
-    # Sum of violations (count_violations)
-    n_count_viol = sum(!is.na(count_violations)),
-    mean_count_viol = round(mean(count_violations, na.rm = TRUE), 3),
-    median_count_viol = median(count_violations, na.rm = TRUE),
-    sd_count_viol = round(sd(count_violations, na.rm = TRUE), 3),
-    
-    # Violation binary (violation_a - assuming this is your binary violation measure)
-    n_viol_bin = sum(!is.na(violation_a)),
-    mean_viol_bin = round(mean(violation_a, na.rm = TRUE), 3),
-    median_viol_bin = median(violation_a, na.rm = TRUE),
-    sd_viol_bin = round(sd(violation_a, na.rm = TRUE), 3),
-    
-    # No Parent Organization
-    n_no_parorg = sum(!is.na(no_parorg)),
-    mean_no_parorg = round(mean(no_parorg, na.rm = TRUE), 3),
-    median_no_parorg = median(no_parorg, na.rm = TRUE),
-    sd_no_parorg = round(sd(no_parorg, na.rm = TRUE), 3),
-    
-    # Civil Society
-    n_civil_soc = sum(!is.na(civil_society)),
-    mean_civil_soc = round(mean(civil_society, na.rm = TRUE), 3),
-    median_civil_soc = median(civil_society, na.rm = TRUE),
-    sd_civil_soc = round(sd(civil_society, na.rm = TRUE), 3),
-    
-    # Rebel Support Binary
-    n_rebel_supp = sum(!is.na(rebelsupport_binary)),
-    mean_rebel_supp = round(mean(rebelsupport_binary, na.rm = TRUE), 3),
-    median_rebel_supp = median(rebelsupport_binary, na.rm = TRUE),
-    sd_rebel_supp = round(sd(rebelsupport_binary, na.rm = TRUE), 3),
-    
-    # Territorial Control
-    n_terr_cont = sum(!is.na(terrcont_binary)),
-    mean_terr_cont = round(mean(terrcont_binary, na.rm = TRUE), 3),
-    median_terr_cont = median(terrcont_binary, na.rm = TRUE),
-    sd_terr_cont = round(sd(terrcont_binary, na.rm = TRUE), 3),
-    
-    # Fighting Capacity
-    n_fight_cap = sum(!is.na(fightcap_binary)),
-    mean_fight_cap = round(mean(fightcap_binary, na.rm = TRUE), 3),
-    median_fight_cap = median(fightcap_binary, na.rm = TRUE),
-    sd_fight_cap = round(sd(fightcap_binary, na.rm = TRUE), 3),
-    
-    # Rebel Strength
-    n_reb_str = sum(!is.na(rebstrength_binary)),
-    mean_reb_str = round(mean(rebstrength_binary, na.rm = TRUE), 3),
-    median_reb_str = median(rebstrength_binary, na.rm = TRUE),
-    sd_reb_str = round(sd(rebstrength_binary, na.rm = TRUE), 3),
-    
-    # Ideology
-    n_ideology = sum(!is.na(ideology)),
-    mean_ideology = round(mean(ideology, na.rm = TRUE), 3),
-    median_ideology = median(ideology, na.rm = TRUE),
-    sd_ideology = round(sd(ideology, na.rm = TRUE), 3),
-    
-    # Merger
-    n_merger = sum(!is.na(merger)),
-    mean_merger = round(mean(merger, na.rm = TRUE), 3),
-    median_merger = median(merger, na.rm = TRUE),
-    sd_merger = round(sd(merger, na.rm = TRUE), 3),
-    
-    # Intensity
-    n_intensity = sum(!is.na(intensity)),
-    mean_intensity = round(mean(intensity, na.rm = TRUE), 3),
-    median_intensity = median(intensity, na.rm = TRUE),
-    sd_intensity = round(sd(intensity, na.rm = TRUE), 3),
-    
-    # Conflict Duration (years)
-    n_duration = sum(!is.na(conflict_duration_years)),
-    mean_duration = round(mean(conflict_duration_years, na.rm = TRUE), 3),
-    median_duration = median(conflict_duration_years, na.rm = TRUE),
-    sd_duration = round(sd(conflict_duration_years, na.rm = TRUE), 3),
-    
-    # Polity (v2x_polyarchy)
-    n_polity = sum(!is.na(v2x_polyarchy)),
-    mean_polity = round(mean(v2x_polyarchy, na.rm = TRUE), 3),
-    median_polity = median(v2x_polyarchy, na.rm = TRUE),
-    sd_polity = round(sd(v2x_polyarchy, na.rm = TRUE), 3),
-    
-    # Log GDPPC
-    n_gdp = sum(!is.na(log_rgdppc)),
-    mean_gdp = round(mean(log_rgdppc, na.rm = TRUE), 3),
-    median_gdp = median(log_rgdppc, na.rm = TRUE),
-    sd_gdp = round(sd(log_rgdppc, na.rm = TRUE), 3)
+# --- Binomial Composition: cbind (violators only) ---
+df_comm_pattern <- model_data_comm_broad %>%
+  filter(total_variety > 0) %>%
+  mutate(
+    disc_count   = as.integer(discriminatory_variety),
+    indisc_count = as.integer(indiscriminate_variety)
   )
 
-# Create a formatted table
-variables <- c("Sum of Violations", "Violation (Binary)", "No Parent Org.", "Civil Society",
-               "Rebel Support Binary", "Territorial Control", "Fighting Capacity", 
-               "Rebel Strength", "Ideology", "Merger", "Intensity", 
-               "Conflict Duration (years)", "Polity", "Log GDPPC")
+m3_comm_pattern <- glm(
+  cbind(disc_count, indisc_count) ~ origin_comm +
+    log_gdp_pc + democracy_z + ideology +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  family = binomial("logit"),
+  data   = df_comm_pattern
+)
+r3_comm_pattern <- tidy_cluster(m3_comm_pattern, ~sideb)
+r3_comm_pattern$ct
+nobs(m3_comm_pattern)
 
-n_values <- c(descriptive_stats$n_count_viol, descriptive_stats$n_viol_bin, 
-              descriptive_stats$n_no_parorg, descriptive_stats$n_civil_soc,
-              descriptive_stats$n_rebel_supp, descriptive_stats$n_terr_cont,
-              descriptive_stats$n_fight_cap, descriptive_stats$n_reb_str,
-              descriptive_stats$n_ideology, descriptive_stats$n_merger,
-              descriptive_stats$n_intensity, descriptive_stats$n_duration,
-              descriptive_stats$n_polity, descriptive_stats$n_gdp)
+# --- Binary: Any Violation ---
+m3_comm_anyviol <- glm(
+  violation_s ~ origin_comm + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_comm_broad,
+  family = binomial("logit")
+)
+r3_comm_anyviol <- tidy_cluster(m3_comm_anyviol, ~sideb)
+r3_comm_anyviol$ct
+nobs(m3_comm_anyviol)
 
-means <- c(descriptive_stats$mean_count_viol, descriptive_stats$mean_viol_bin,
-           descriptive_stats$mean_no_parorg, descriptive_stats$mean_civil_soc,
-           descriptive_stats$mean_rebel_supp, descriptive_stats$mean_terr_cont,
-           descriptive_stats$mean_fight_cap, descriptive_stats$mean_reb_str,
-           descriptive_stats$mean_ideology, descriptive_stats$mean_merger,
-           descriptive_stats$mean_intensity, descriptive_stats$mean_duration,
-           descriptive_stats$mean_polity, descriptive_stats$mean_gdp)
+# --- Binary: Discriminatory ---
+m3_comm_disc_bin <- glm(
+  discriminatory_binary ~ origin_comm + log_gdp_pc + democracy_z + ideology +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_comm_broad,
+  family = binomial("logit")
+)
+r3_comm_disc_bin <- tidy_cluster(m3_comm_disc_bin, ~sideb)
+r3_comm_disc_bin$ct
+nobs(m3_comm_disc_bin)
 
-medians <- c(descriptive_stats$median_count_viol, descriptive_stats$median_viol_bin,
-             descriptive_stats$median_no_parorg, descriptive_stats$median_civil_soc,
-             descriptive_stats$median_rebel_supp, descriptive_stats$median_terr_cont,
-             descriptive_stats$median_fight_cap, descriptive_stats$median_reb_str,
-             descriptive_stats$median_ideology, descriptive_stats$median_merger,
-             descriptive_stats$median_intensity, descriptive_stats$median_duration,
-             descriptive_stats$median_polity, descriptive_stats$median_gdp)
+# --- Binary: Indiscriminate ---
+m3_comm_indisc_bin <- glm(
+  indiscriminate_binary ~ origin_comm + log_gdp_pc + democracy_z + ideology +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data   = model_data_comm_broad,
+  family = binomial("logit")
+)
+r3_comm_indisc_bin <- tidy_cluster(m3_comm_indisc_bin, ~sideb)
+r3_comm_indisc_bin$ct
+nobs(m3_comm_indisc_bin)
 
-sds <- c(descriptive_stats$sd_count_viol, descriptive_stats$sd_viol_bin,
-         descriptive_stats$sd_no_parorg, descriptive_stats$sd_civil_soc,
-         descriptive_stats$sd_rebel_supp, descriptive_stats$sd_terr_cont,
-         descriptive_stats$sd_fight_cap, descriptive_stats$sd_reb_str,
-         descriptive_stats$sd_ideology, descriptive_stats$sd_merger,
-         descriptive_stats$sd_intensity, descriptive_stats$sd_duration,
-         descriptive_stats$sd_polity, descriptive_stats$sd_gdp)
+# --- Count: Total Variety ---
+m3_comm_total <- glm.nb(
+  total_variety ~ origin_comm + log_gdp_pc + ideology + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad
+)
+r3_comm_total <- tidy_cluster(m3_comm_total, ~sideb)
+r3_comm_total$ct
+nobs(m3_comm_total)
 
-# Create final table
-descriptive_table <- data.frame(
-  Variable = variables,
-  N = n_values,
-  Mean = means,
-  Median = medians,
-  SD = sds
+# --- Count: Discriminatory Variety ---
+m3_comm_disc_var <- glm.nb(
+  discriminatory_variety ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad
+)
+r3_comm_disc_var <- tidy_cluster(m3_comm_disc_var, ~sideb)
+r3_comm_disc_var$ct
+nobs(m3_comm_disc_var)
+
+# --- Count: Indiscriminate Variety ---
+m3_comm_indisc_var <- glm.nb(
+  indiscriminate_variety ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad
+)
+r3_comm_indisc_var <- tidy_cluster(m3_comm_indisc_var, ~sideb)
+r3_comm_indisc_var$ct
+nobs(m3_comm_indisc_var)
+
+# --- Count: Discriminatory Severity ---
+m3_comm_disc_sev <- glm.nb(
+  discriminatory_severity ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad
+)
+r3_comm_disc_sev <- tidy_cluster(m3_comm_disc_sev, ~sideb)
+r3_comm_disc_sev$ct
+nobs(m3_comm_disc_sev)
+
+# --- Count: Indiscriminate Severity ---
+m3_comm_indisc_sev <- glm.nb(
+  indiscriminate_severity ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad
+)
+r3_comm_indisc_sev <- tidy_cluster(m3_comm_indisc_sev, ~sideb)
+r3_comm_indisc_sev$ct
+nobs(m3_comm_indisc_sev)
+
+# --- OLS: Violence Diff ---
+m3_comm_diff <- lm(
+  violence_diff ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  data = model_data_comm_broad %>% filter(!is.na(violence_share_disc))
+)
+r3_comm_diff <- tidy_cluster(m3_comm_diff, ~sideb)
+r3_comm_diff$ct
+nobs(m3_comm_diff)
+
+# --- Violence Ratio ---
+m3_comm_ratio <- glm(
+  violence_ratio_smooth ~ origin_comm + log_gdp_pc + democracy_z +
+    rebstrength_num + terrcont_num + rebel_support_num +
+    intensity + conflict_duration,
+  family = gaussian("log"),
+  data   = model_data_comm_broad %>% filter(!is.na(violence_ratio_smooth))
+)
+tidy_cluster(m3_comm_ratio, ~sideb)$ct
+nobs(m3_comm_ratio)
+
+
+# ============================================================
+# SECTION 4: DESCRIPTIVE CHECK
+# ============================================================
+
+civil_groups <- model_data_all %>%
+  filter(origin_3cat == "civil") %>%
+  count(sideb) %>%
+  arrange(sideb)
+print(civil_groups)
+
+
+# ============================================================
+# SECTION 5: PLOTS
+# ============================================================
+
+# --- Color and shape aesthetics ---
+origin_colors <- c(
+  "Civil Society"  = "#E07B6A",
+  "Community Ties" = "#4BAEA0",
+  "Parentless"     = "#F0A500",
+  "Violent Origin" = "#6A5ACD"
 )
 
-print(descriptive_table)
-
-
-
-# Fit logit model
-logit_model_corrected <- glm(
-  violation_s ~
-    no_parorg +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc,
-  data = hr_model_corrected,
-  family = binomial()
+origin_shapes <- c(
+  "Civil Society Specification"  = 16,
+  "Community Ties Specification" = 17
 )
 
-# Clustered standard errors by conflictid
-cluster_se_corrected <- vcovCL(
-  logit_model_corrected,
-  cluster = hr_model_corrected$conflictid
-)
-
-# Results with clustered SEs
-coeftest(logit_model_corrected, vcov = cluster_se_corrected)
-
-
-### Negative Binomial Model ###
-hr_model_nreg <- full_model %>% # Fixed: removed "name" and used correct dataset
-  filter(if_all(
-    c(
-      conflictid,
-      count_violations,
-      no_parorg, # Fixed: conflictid instead of conflict_id
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc # Fixed: consistent variables
+# --- Build predicted discriminatory share data ---
+pred_disc_civil <- predictions(
+  m2_civil_share,
+  newdata = datagrid(
+    origin_3cat       = c("violent", "civil", "noparent"),
+    log_gdp_pc        = mean(model_data_all$log_gdp_pc, na.rm = TRUE),
+    democracy_z       = mean(model_data_all$democracy_z, na.rm = TRUE),
+    ideology          = mean(model_data_all$ideology, na.rm = TRUE),
+    rebstrength_num   = mean(model_data_all$rebstrength_num, na.rm = TRUE),
+    terrcont_num      = mean(model_data_all$terrcont_num, na.rm = TRUE),
+    rebel_support_num = mean(model_data_all$rebel_support_num, na.rm = TRUE),
+    intensity         = mean(model_data_all$intensity, na.rm = TRUE),
+    conflict_duration = mean(model_data_all$conflict_duration, na.rm = TRUE)
+  )
+) %>%
+  mutate(
+    Origin = case_when(
+      origin_3cat == "civil"    ~ "Civil Society",
+      origin_3cat == "violent"  ~ "Violent Origin",
+      origin_3cat == "noparent" ~ "Parentless"
     ),
-    ~ !is.na(.) # Fixed: proper handling for all data types
-  ))
-
-
-nreg_model <- glm.nb(
-  count_violations ~
-    no_parorg +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc, # Fixed: consistent variables
-  data = hr_model_nreg,
-  control = glm.control(maxit = 500)
-)
-
-
-cluster_se_nreg <- vcovCL(nreg_model, cluster = hr_model_nreg$conflictid) # Fixed: conflictid
-coeftest(nreg_model, vcov = cluster_se_nreg)
-
-# Check sample size
-nrow(hr_model_nreg)
-
-
-### Negative Binomial Model ###
-hr_model_nreg <- full_model %>% # Fixed: removed "name" and used correct dataset
-  filter(if_all(
-    c(
-      conflictid,
-      count_violations,
-      no_parorg, # Fixed: conflictid instead of conflict_id
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc # Fixed: consistent variables
-    ),
-    ~ !is.na(.) # Fixed: proper handling for all data types
-  ))
-
-
-nreg_model <- glm.nb(
-  count_violations ~
-    no_parorg +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc, # Fixed: consistent variables
-  data = hr_model_nreg,
-  control = glm.control(maxit = 500)
-)
-
-
-cluster_se_nreg <- vcovCL(nreg_model, cluster = hr_model_nreg$conflictid) # Fixed: conflictid
-coeftest(nreg_model, vcov = cluster_se_nreg)
-
-# Check sample size
-nrow(hr_model_nreg)
-
-
-# Calculating Predicted Counts
-
-
-# Step 1: Run the model with clustered standard errors
-nreg_model_no_parorg <- glm.nb(count_violations ~ no_parorg + rebelsupport_binary + 
-                                 terrcont_binary + fightcap_binary + rebstrength_binary + 
-                                 ideology + merger + intensity + duration_years_ongoing + 
-                                 vdem_edi + log_rgdppc, 
-                               data = hr_model_corrected)
-
-# Calculate clustered standard errors
-clustered_se <- coeftest(nreg_model_no_parorg, 
-                         vcov = vcovCL(nreg_model_no_parorg, 
-                                       cluster = hr_model_corrected$conflictid))
-
-# Step 2: PREDICTED COUNTS
-hr_model_corrected$predicted_counts <- predict(nreg_model_no_parorg, type = "response")
-
-# Calculate average predicted counts by group
-predicted_summary <- hr_model_corrected %>%
-  group_by(no_parorg) %>%
-  summarise(
-    Mean_Predicted_Count = mean(predicted_counts, na.rm = TRUE),
-    Count = n()
+    Model = "Civil Society Specification"
   )
 
-# Plot predicted counts
-plot_predicted <- ggplot(predicted_summary, aes(x = factor(no_parorg), y = Mean_Predicted_Count)) +
-  geom_col(fill = "steelblue", width = 0.6) +
-  geom_text(aes(label = round(Mean_Predicted_Count, 2)), vjust = -0.5, size = 4) +
-  scale_x_discrete(labels = c("Has Parent Org", "No Parent Org")) +
-  labs(title = "Predicted Count of Violations by Parent Organization Status",
-       x = "Parent Organization Status",
-       y = "Expected Count of Violations") +
-  theme_minimal(base_size = 14)
-
-print(plot_predicted)
-
-# Step 3: MARGINAL EFFECTS
-marginal_effects <- margins(nreg_model_no_parorg, variables = "no_parorg")
-marginal_summary <- summary(marginal_effects)
-
-# Extract values for marginal effects plot
-me_value <- marginal_summary$AME
-lower_ci <- marginal_summary$lower
-upper_ci <- marginal_summary$upper
-
-# Plot marginal effects with confidence intervals
-plot_marginal <- ggplot(data.frame(
-  variable = "No Parent Organization",
-  effect = me_value,
-  lower = lower_ci,
-  upper = upper_ci
-), aes(x = variable, y = effect)) +
-  geom_point(size = 4, color = "red") +
-  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.1, size = 1, color = "red") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 1) +
-  labs(title = "Marginal Effect of No Parent Organization",
-       subtitle = "on Expected Count of Human Rights Violations",
-       x = "", 
-       y = "Change in Expected Count",
-       caption = "Error bars show 95% confidence intervals") +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(hjust = 0.5),
-    plot.subtitle = element_text(hjust = 0.5),
-    plot.caption = element_text(hjust = 0.5)
+pred_disc_comm <- predictions(
+  m3_comm_share,
+  newdata = datagrid(
+    origin_comm       = c("violent", "community", "noparent"),
+    log_gdp_pc        = mean(model_data_comm_broad$log_gdp_pc, na.rm = TRUE),
+    democracy_z       = mean(model_data_comm_broad$democracy_z, na.rm = TRUE),
+    ideology          = mean(model_data_comm_broad$ideology, na.rm = TRUE),
+    rebstrength_num   = mean(model_data_comm_broad$rebstrength_num, na.rm = TRUE),
+    terrcont_num      = mean(model_data_comm_broad$terrcont_num, na.rm = TRUE),
+    rebel_support_num = mean(model_data_comm_broad$rebel_support_num, na.rm = TRUE),
+    intensity         = mean(model_data_comm_broad$intensity, na.rm = TRUE),
+    conflict_duration = mean(model_data_comm_broad$conflict_duration, na.rm = TRUE)
+  )
+) %>%
+  mutate(
+    Origin = case_when(
+      origin_comm == "community" ~ "Community Ties",
+      origin_comm == "violent"   ~ "Violent Origin",
+      origin_comm == "noparent"  ~ "Parentless"
+    ),
+    Model = "Community Ties Specification"
   )
 
-print(plot_marginal)
+pred_disc <- bind_rows(pred_disc_civil, pred_disc_comm) %>%
+  mutate(Origin = factor(Origin, levels = c("Civil Society", "Community Ties",
+                                            "Parentless", "Violent Origin")))
 
-# Print summaries
-cat("=== PREDICTED COUNTS SUMMARY ===\n")
-print(predicted_summary)
-
-cat("\n=== MARGINAL EFFECTS SUMMARY ===\n")
-print(marginal_summary)
-
-cat("\nInterpretation:\n")
-cat("- Groups with parent org expect", round(predicted_summary$Mean_Predicted_Count[1], 2), "violations\n")
-cat("- Groups without parent org expect", round(predicted_summary$Mean_Predicted_Count[2], 2), "violations\n")
-cat("- Marginal effect:", round(me_value, 3), "change in expected violations\n")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-###### ZINB model (count and zero-inflation) #####
-hr_model_zinb <- full_model %>% # Fixed: use correct dataset name
-  filter(if_all(
-    c(
-      conflictid,
-      count_violations,
-      no_parorg, # Fixed: added conflictid, consistent clustering
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc # Fixed: consistent variables
+# --- Build predicted indiscriminate share data ---
+pred_indisc_civil <- predictions(
+  m2_civil_indisc,
+  newdata = datagrid(
+    origin_3cat       = c("violent", "civil", "noparent"),
+    log_gdp_pc        = mean(model_data_all$log_gdp_pc, na.rm = TRUE),
+    democracy_z       = mean(model_data_all$democracy_z, na.rm = TRUE),
+    rebstrength_num   = mean(model_data_all$rebstrength_num, na.rm = TRUE),
+    terrcont_num      = mean(model_data_all$terrcont_num, na.rm = TRUE),
+    rebel_support_num = mean(model_data_all$rebel_support_num, na.rm = TRUE),
+    intensity         = mean(model_data_all$intensity, na.rm = TRUE),
+    conflict_duration = mean(model_data_all$conflict_duration, na.rm = TRUE)
+  )
+) %>%
+  mutate(
+    Origin = case_when(
+      origin_3cat == "civil"    ~ "Civil Society",
+      origin_3cat == "violent"  ~ "Violent Origin",
+      origin_3cat == "noparent" ~ "Parentless"
     ),
-    ~ !is.na(.) # Fixed: handle all data types
-  ))
-
-
-zinb_model <- zeroinfl(
-  count_violations ~
-    no_parorg +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc | # Fixed: consistent variables
-    
-    no_parorg +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc, # Fixed: consistent variables
-  
-  data = hr_model_zinb,
-  dist = "negbin"
-)
-
-#### Step-by-step: Cluster-robust SE for a ZINB model
-summary(zinb_model)
-
-
-# Cluster variable (must be the same length as data)
-cluster_var <- hr_model_zinb$conflictid # Fixed: consistent clustering variable
-
-# Compute clustered variance-covariance matrix
-cluster_vcov <- sandwich::vcovCL(zinb_model, cluster = cluster_var)
-
-# Use coeftest to display results with clustered SEs
-coeftest(zinb_model, vcov = cluster_vcov)
-
-# Check sample size
-nrow(hr_model_zinb)
-
-
-
-
-#### Civil Society Models #####
-
-
-
-hr_model_cs_logit <- full_model %>%
-  filter(if_all(
-    c(
-      conflictid,
-      violation_s,
-      civil_society,
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc
-    ),
-    ~ !is.na(.)
-  ))
-
-
-# Fit logit model
-logit_model_cs <- glm(
-  violation_s ~
-    civil_society +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc,
-  data = hr_model_cs_logit,
-  family = binomial()
-)
-
-
-cluster_se_cs_logit <- vcovCL(
-  logit_model_cs,
-  cluster = hr_model_cs_logit$conflictid
-)
-coeftest(logit_model_cs, vcov = cluster_se_cs_logit)
-
-
-# Check sample size
-nrow(hr_model_cs_logit)
-
-
-
-
-#  2. Negative Binomial Model:
-# Filter to complete cases
-
-
-
-hr_model_cs_nreg <- full_model %>%
-  filter(if_all(
-    c(
-      conflictid,
-      count_violations,
-      civil_society,
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc
-    ),
-    ~ !is.na(.)
-  ))
-
-
-nreg_model_cs <- glm.nb(
-  count_violations ~
-    civil_society +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc,
-  data = hr_model_cs_nreg,
-  control = glm.control(maxit = 500)
-)
-
-
-cluster_se_cs_nreg <- vcovCL(
-  nreg_model_cs,
-  cluster = hr_model_cs_nreg$conflictid
-)
-coeftest(nreg_model_cs, vcov = cluster_se_cs_nreg)
-
-# Check sample size
-nrow(hr_model_cs_nreg)
-
-
-
-
-
-# Predicted expected count of violations (μ_i) for each observation
-
-# Use consistent dataset
-hr_model_cs_nreg$predicted_counts <- predict(nreg_model_cs, type = "response")
-hr_model_cs_nreg %>%
-  group_by(civil_society) %>%
-  summarise(
-    Mean_Predicted_Count = mean(predicted_counts, na.rm = TRUE),
-    Count = n()
+    Model = "Civil Society Specification"
   )
 
+pred_indisc_comm <- predictions(
+  m3_comm_indisc,
+  newdata = datagrid(
+    origin_comm       = c("violent", "community", "noparent"),
+    log_gdp_pc        = mean(model_data_comm_broad$log_gdp_pc, na.rm = TRUE),
+    democracy_z       = mean(model_data_comm_broad$democracy_z, na.rm = TRUE),
+    rebstrength_num   = mean(model_data_comm_broad$rebstrength_num, na.rm = TRUE),
+    terrcont_num      = mean(model_data_comm_broad$terrcont_num, na.rm = TRUE),
+    rebel_support_num = mean(model_data_comm_broad$rebel_support_num, na.rm = TRUE),
+    intensity         = mean(model_data_comm_broad$intensity, na.rm = TRUE),
+    conflict_duration = mean(model_data_comm_broad$conflict_duration, na.rm = TRUE)
+  )
+) %>%
+  mutate(
+    Origin = case_when(
+      origin_comm == "community" ~ "Community Ties",
+      origin_comm == "violent"   ~ "Violent Origin",
+      origin_comm == "noparent"  ~ "Parentless"
+    ),
+    Model = "Community Ties Specification"
+  )
 
-cs_nb_pred <- ggpredict(nreg_model_cs, terms = "civil_society [0,1]")
+pred_indisc <- bind_rows(pred_indisc_civil, pred_indisc_comm) %>%
+  mutate(Origin = factor(Origin, levels = c("Civil Society", "Community Ties",
+                                            "Parentless", "Violent Origin")))
 
-
-p_nb <- plot(cs_nb_pred) +
+# --- Plot 1: Discriminatory Share ---
+p_disc_single <- ggplot(pred_disc,
+                        aes(x = Origin, y = estimate,
+                            ymin = conf.low, ymax = conf.high,
+                            color = Origin, shape = Model)) +
+  geom_pointrange(position = position_dodge(width = 0.5),
+                  size = 0.7, linewidth = 0.8) +
+  scale_color_manual(values = origin_colors) +
+  scale_shape_manual(values = origin_shapes) +
+  scale_y_continuous(limits = c(0, 1),
+                     labels = scales::percent_format()) +
   labs(
-    title = "Predicted Number of Violations by Civil Society Origin",
-    x = "Civil Society",
-    y = "Expected Count of Violations"
+    title   = "Predicted Discriminatory Share by Organizational Origin",
+    x       = "Organizational Origin",
+    y       = "Predicted Discriminatory Share",
+    color   = "Origin Category",
+    shape   = "Model Specification",
+    caption = "Note: Predictions computed holding all controls at sample means.\nCircle = Civil Society Specification; Triangle = Community Ties Specification."
   ) +
-  theme_minimal(base_size = 14) +
+  theme_minimal(base_size = 11) +
   theme(
-    plot.title = element_text(size = 12)  # Adjust title font size here
+    legend.position  = "bottom",
+    legend.box       = "vertical",
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 8, face = "bold"),
+    legend.key.size  = unit(0.7, "lines"),
+    plot.title       = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 9),
+    plot.caption     = element_text(size = 7, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
   )
 
-# Show the plot
-print(p_nb)
+ggsave("predicted_disc_share.png", p_disc_single,
+       width = 8, height = 7, dpi = 300)
+print(p_disc_single)
 
-# Save the plot
-ggsave("predicted_counts_nbreg_plot1.png", plot = p_nb, width = 6, height = 4, dpi = 300)
-
-
-
-
-# Marginal Effect
-
-# Calculate marginal effect with confidence intervals
-civil_society_marginal <- margins(nreg_model_cs, variables = "civil_society")
-civil_society_summary <- summary(civil_society_marginal)
-
-# Extract values for plotting
-me_value <- civil_society_summary$AME
-lower_ci <- civil_society_summary$lower
-upper_ci <- civil_society_summary$upper
-
-
-
-# Create a more informative plot with confidence intervals
-
-ggplot(data.frame(
-  variable = "Civil Society",
-  effect = me_value,
-  lower = lower_ci,
-  upper = upper_ci
-), aes(x = variable, y = effect)) +
-  geom_point(size = 4, color = "blue") +
-  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.1, size = 1, color = "blue") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+# --- Plot 2: Indiscriminate Share ---
+p_indisc_single <- ggplot(pred_indisc,
+                          aes(x = Origin, y = estimate,
+                              ymin = conf.low, ymax = conf.high,
+                              color = Origin, shape = Model)) +
+  geom_pointrange(position = position_dodge(width = 0.5),
+                  size = 0.7, linewidth = 0.8) +
+  scale_color_manual(values = origin_colors) +
+  scale_shape_manual(values = origin_shapes) +
+  scale_y_continuous(limits = c(0, 1),
+                     labels = scales::percent_format()) +
   labs(
-    title = "Marginal Effect of Civil Society Background",
-    subtitle = "on Expected Count of Human Rights Violations",
-    x = "",
-    y = "Change in Expected Count",
-    caption = "Error bars show 95% confidence intervals"
+    title   = "Predicted Indiscriminate Share by Organizational Origin",
+    x       = "Organizational Origin",
+    y       = "Predicted Indiscriminate Share",
+    color   = "Origin Category",
+    shape   = "Model Specification",
+    caption = "Note: Predictions computed holding all controls at sample means.\nCircle = Civil Society Specification; Triangle = Community Ties Specification."
   ) +
-  theme_minimal(base_size = 14) +
+  theme_minimal(base_size = 11) +
   theme(
-    plot.title = element_text(hjust = 0.5, size = 14),
-    plot.subtitle = element_text(hjust = 0.5, size = 12),
-    plot.caption = element_text(hjust = 0.5, size = 10)
-  ) +
-  ylim(min(lower_ci) - 0.05, max(upper_ci) + 0.05)
-
-
-
-ggsave("civ_effect_nbreg_plot1.png", plot = p_nb, width = 6, height = 4, dpi = 300)
-
-print(civil_society_summary)
-
-
-
-# Step 1: Get predicted counts by civil society group
-predicted_summary <- hr_model_cs_nreg %>%
-  group_by(civil_society) %>%
-  summarise(
-    Mean_Predicted_Count = mean(predicted_counts, na.rm = TRUE),
-    Count = n()
+    legend.position  = "bottom",
+    legend.box       = "vertical",
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 8, face = "bold"),
+    legend.key.size  = unit(0.7, "lines"),
+    plot.title       = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 9),
+    plot.caption     = element_text(size = 7, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
   )
 
-print(predicted_summary)
+ggsave("predicted_indisc_share.png", p_indisc_single,
+       width = 8, height = 7, dpi = 300)
+print(p_indisc_single)
 
-# Step 2: Extract the values for calculation
-non_civil_society_count <- predicted_summary$Mean_Predicted_Count[predicted_summary$civil_society == 0]
-civil_society_count <- predicted_summary$Mean_Predicted_Count[predicted_summary$civil_society == 1]
+# --- Plot 3: Density Plot — Raw Discriminatory Share ---
+df_density <- model_data_comm_broad %>%
+  filter(!is.na(violence_share_disc) & !is.na(origin_comm)) %>%
+  mutate(Origin = case_when(
+    origin_comm == "community" & civil_society == 1 ~ "Civil Society",
+    origin_comm == "community" & civil_society == 0 ~ "Political Party",
+    origin_comm == "violent"                        ~ "Violent Origin",
+    origin_comm == "noparent"                       ~ "Parentless"
+  ))
 
-# Step 3: Calculate percentage reduction
-percentage_reduction <- ((non_civil_society_count - civil_society_count) / non_civil_society_count) * 100
-
-# Step 4: Print results
-cat("=== PERCENTAGE REDUCTION CALCULATION ===\n")
-cat("Non-civil society groups:", round(non_civil_society_count, 2), "expected violations\n")
-cat("Civil society groups:", round(civil_society_count, 2), "expected violations\n")
-cat("Absolute difference (marginal effect):", round(non_civil_society_count - civil_society_count, 2), "\n")
-cat("Percentage reduction:", round(percentage_reduction, 1), "%\n")
-
-# Step 5: Verify this matches your marginal effect
-cat("Marginal effect from margins package:", round(me_value, 2), "\n")
-cat("Manual calculation difference:", round(non_civil_society_count - civil_society_count, 2), "\n")
-
-
-
-# Calculate marginal effect with confidence intervals
-civil_society_marginal <- margins(nreg_model_cs, variables = "civil_society")
-civil_society_summary <- summary(civil_society_marginal)
-
-# Extract values for plotting
-me_value <- civil_society_summary$AME
-lower_ci <- civil_society_summary$lower
-upper_ci <- civil_society_summary$upper
-
-# Create the marginal effects plot
-marginal_plot <- ggplot(data.frame(
-  variable = "Civil Society",
-  effect = me_value,
-  lower = lower_ci,
-  upper = upper_ci
-), aes(x = variable, y = effect)) +
-  geom_point(size = 4, color = "blue") +
-  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.1, size = 1, color = "blue") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+p_density <- ggplot(df_density,
+                    aes(x = violence_share_disc,
+                        fill = Origin, color = Origin)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_x_continuous(limits = c(0, 1),
+                     labels = scales::percent_format()) +
   labs(
-    title = "Marginal Effect of Civil Society Background",
-    subtitle = "on Expected Count of Human Rights Violations",
-    x = "",
-    y = "Change in Expected Count",
-    caption = "Error bars show 95% confidence intervals"
+    title   = "Distribution of Discriminatory Violation Share by Organizational Origin",
+    x       = "Discriminatory Share of Violation Repertoire",
+    y       = "Density",
+    fill    = "Origin Category",
+    color   = "Origin Category"
   ) +
-  theme_minimal(base_size = 14) +
+  theme_minimal(base_size = 11) +
   theme(
-    plot.title = element_text(hjust = 0.5, size = 14),
-    plot.subtitle = element_text(hjust = 0.5, size = 12),
-    plot.caption = element_text(hjust = 0.5, size = 10)
-  ) +
-  ylim(min(lower_ci) - 0.05, max(upper_ci) + 0.05)
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
 
-# Display the plot
-print(marginal_plot)
-
-# Save the plot
-ggsave("marginal_effect_civil_society.png", plot = marginal_plot, 
+ggsave("density_disc_share.png", p_density,
        width = 8, height = 6, dpi = 300)
+print(p_density)
 
-
-
-
-
-
-
-
-
-
-
-## 3. Zero-Inflated Negative Binomial Model:
-
-# Filter to complete cases
-hr_model_cs_zinb <- full_model %>%
-  filter(if_all(
-    c(
-      conflictid,
-      count_violations,
-      civil_society,
-      rebelsupport_binary,
-      terrcont_binary,
-      fightcap_binary,
-      rebstrength_binary,
-      ideology,
-      merger,
-      intensity,
-      duration_years_ongoing,
-      vdem_edi,
-      log_rgdppc
-    ),
-    ~ !is.na(.)
-  ))
-
-
-
-
-zinb_model_cs <- zeroinfl(
-  count_violations ~
-    civil_society +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc |
-    
-    civil_society +
-    rebelsupport_binary +
-    terrcont_binary +
-    fightcap_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc,
-  
-  data = hr_model_cs_zinb,
-  dist = "negbin"
-)
-
-summary(zinb_model_cs)
-
-
-cluster_var_cs <- hr_model_cs_zinb$conflictid
-cluster_vcov_cs <- sandwich::vcovCL(zinb_model_cs, cluster = cluster_var_cs)
-coeftest(zinb_model_cs, vcov = cluster_vcov_cs)
-
-# Check sample size
-nrow(hr_model_cs_zinb)
-
-
-
-
-
-# Negative binomial with interaction
-nreg_model_interact_cs <- glm.nb(
-  count_violations ~
-    civil_society *
-    fightcap_binary +
-    rebelsupport_binary +
-    terrcont_binary +
-    rebstrength_binary +
-    ideology +
-    merger +
-    intensity +
-    duration_years_ongoing +
-    vdem_edi +
-    log_rgdppc,
-  data = hr_model_cs_nreg, # Use the correctly filtered dataset
-  control = glm.control(maxit = 500)
-)
-
-# Clustered SEs
-cluster_se_nreg_interact <- vcovCL(
-  nreg_model_interact_cs,
-  cluster = hr_model_cs_nreg$conflictid
-)
-nreg_interact_results <- coeftest(
-  nreg_model_interact_cs,
-  vcov = cluster_se_nreg_interact
-)
-print(nreg_interact_results)
-
-# Marginal effects of civil_society at each level of fightcap_binary
-library(margins)
-mfx_interact <- margins(
-  nreg_model_interact_cs,
-  variables = "civil_society",
-  at = list(fightcap_binary = c(0, 1)),
-  vcov = cluster_se_nreg_interact
-)
-
-# Format for plotting
-mfx_df <- summary(mfx_interact)
-print(mfx_df)
-str(mfx_df)
-
-
-mfx_plot_data <- data.frame(
-  FightCap = factor(
-    c(0, 1),
-    levels = c(0, 1),
-    labels = c("No Fight Capacity", "Has Fight Capacity")
-  ),
-  AME = mfx_df$AME,
-  SE = mfx_df$SE,
-  lower = mfx_df$lower,
-  upper = mfx_df$upper
-)
-ggplot(mfx_plot_data, aes(x = FightCap, y = AME)) +
-  geom_point(size = 3) +
-  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "darkred") +
-  labs(
-    title = "Marginal Effect of Civil Society by Fight Capacity",
-    x = "Rebel Fight Capacity",
-    y = "Average Marginal Effect"
-  ) +
-  theme_minimal(base_size = 14)
-
-
-# Check sample size
-nrow(hr_model_cs_nreg)
-
-
-#Plots
-
-# Calculate violation percentages by organizational type
-violation_summary <- full_model %>%
-  filter(!is.na(count_violations), !is.na(no_parorg), !is.na(civil_society)) %>%
-  summarise(
-    # Total violations by no_parorg groups
-    violations_no_parorg = sum(count_violations[no_parorg == 1], na.rm = TRUE),
-    violations_has_parorg = sum(count_violations[no_parorg == 0], na.rm = TRUE),
-    
-    # Total violations by civil_society groups
-    violations_civil_society = sum(
-      count_violations[civil_society == 1],
-      na.rm = TRUE
-    ),
-    violations_not_civil_society = sum(
-      count_violations[civil_society == 0],
-      na.rm = TRUE
-    ),
-    
-    # Total violations overall
-    total_violations = sum(count_violations, na.rm = TRUE)
-  ) %>%
-  mutate(
-    # Calculate percentages
-    pct_no_parorg = (violations_no_parorg / total_violations) * 100,
-    pct_has_parorg = (violations_has_parorg / total_violations) * 100,
-    pct_civil_society = (violations_civil_society / total_violations) * 100,
-    pct_not_civil_society = (violations_not_civil_society / total_violations) *
-      100
-  )
-
-# Create data for plotting
-plot_data <- data.frame(
-  Group_Type = c(
-    "No Parent Org",
-    "Has Parent Org",
-    "Civil Society",
-    "Not Civil Society"
-  ),
-  Percentage = c(
-    violation_summary$pct_no_parorg,
-    violation_summary$pct_has_parorg,
-    violation_summary$pct_civil_society,
-    violation_summary$pct_not_civil_society
-  ),
-  Category = c("Parent Org", "Parent Org", "Civil Society", "Civil Society")
-)
-
-# Create bar chart
-ggplot(plot_data, aes(x = Group_Type, y = Percentage, fill = Category)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  geom_text(
-    aes(label = paste0(round(Percentage, 1), "%")),
-    vjust = -0.5,
-    size = 4,
-    fontface = "bold"
-  ) +
-  labs(
-    title = "Percentage of Total Violations by Organizational Type",
-    x = "Group Type",
-    y = "Percentage of Total Violations",
-    fill = "Classification"
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_fill_manual(
-    values = c("Parent Org" = "steelblue", "Civil Society" = "darkorange")
-  )
-
-# Print the actual percentages
-print(violation_summary)
-
-
-# Create bar chart with percentage labels for both civil society and No parents
-library(ggplot2)
-ggplot(plot_data, aes(x = Group_Type, y = Percentage, fill = Group_Type)) +
-  geom_bar(stat = "identity") +
-  geom_text(
-    aes(label = paste0(round(Percentage, 1), "%")),
-    vjust = -0.5,
-    size = 4,
-    fontface = "bold"
-  ) + # Add percentage labels
-  labs(
-    title = "Percentage of Total Violations by Group Type",
-    x = "Group Type",
-    y = "Percentage of Total Violations"
-  ) +
-  theme_minimal(base_size = 14) +
-  scale_fill_manual(
-    values = c("Civil Society" = "darkorange", "No Parent Org" = "steelblue")
-  ) +
-  theme(legend.position = "none") +
-  ylim(0, max(plot_data$Percentage) * 1.1) # Add some space above bars for labels
-
-
-# Count observations for each group type
-obs_counts <- full_model %>%
-  filter(!is.na(civil_society), !is.na(no_parorg)) %>%
-  summarise(
-    civil_society_obs = sum(civil_society == 1, na.rm = TRUE),
-    no_parorg_obs = sum(no_parorg == 1, na.rm = TRUE)
-  )
-
-# Create data for plotting
-obs_plot_data <- data.frame(
-  Group_Type = c("Civil Society", "No Parent Org"),
-  N_Observations = c(obs_counts$civil_society_obs, obs_counts$no_parorg_obs)
-)
-
-# Create bar chart with observation counts
-library(ggplot2)
-ggplot(
-  obs_plot_data,
-  aes(x = Group_Type, y = N_Observations, fill = Group_Type)
-) +
-  geom_bar(stat = "identity") +
-  geom_text(
-    aes(label = N_Observations),
-    vjust = -0.5,
-    size = 4,
-    fontface = "bold"
-  ) + # Add count labels
-  labs(
-    title = "Number of Observations by Group Type",
-    x = "Group Type",
-    y = "Number of Observations"
-  ) +
-  theme_minimal(base_size = 14) +
-  scale_fill_manual(
-    values = c("Civil Society" = "darkorange", "No Parent Org" = "steelblue")
-  ) +
-  theme(legend.position = "none") +
-  ylim(0, max(obs_plot_data$N_Observations) * 1.1) # Add space for labels
-
-# Print the actual counts
-print(obs_plot_data)
+# ============================================================
+# END OF ANALYSIS
+# ============================================================
