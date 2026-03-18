@@ -47,7 +47,6 @@ The V-Dem dataset (`V-Dem-CY-Core-v15.dta`, ~411MB) exceeds GitHub's file size l
 
 The analysis constructs mutually exclusive origin categories from FORGE parent-organization indicators and employs multiple empirical approaches:
 
-- **Negative Binomial models** for the count of violations(Total Violations)
 - **Fractional logit models** for compositional outcomes (discriminatory violence share)
 - **Binomial composition models** for the ratio of discriminatory to indiscriminate violations
 - **Negative binomial regression** for violation counts and variety measures
@@ -100,3 +99,12 @@ Email: osomide@vols.utk.edu
 ## License
 
 This work is licensed under the [MIT License](LICENSE). You are free to use, modify, and distribute the code with attribution. Please cite the original data sources when using the integrated dataset.
+
+
+## Citation
+
+If you use this data or code, please cite:
+
+Somide, Olusegun Nicholas. 2026. "Rebel Groups' Foundation and Human Rights
+Violations: Why Do Some Rebel Groups Commit Human Rights Abuses More Intensively
+While Others Do Not?" Working Paper, University of Tennessee, Knoxville.
