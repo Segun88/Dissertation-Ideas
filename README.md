@@ -98,7 +98,7 @@ Email: osomide@vols.utk.edu
 
 ## License
 
-This work is licensed under the [MIT License](LICENSE). You are free to use, modify, and distribute the code with attribution. Please cite the original data sources when using the integrated dataset.
+
 
 
 ## Citation
